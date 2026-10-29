@@ -6,6 +6,38 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Project-scoped memory.** Memory is now organised into scopes: a session
+  reads its own project scope (`project:<slug>`, derived from the git root)
+  plus any configured extra scopes, with `global` available as an opt-in scope
+  instead of being the only store. Each scope has its own `MEMORY.md`,
+  `daily/`, scratchpad, recovery records and qmd collection.
+- `.pi/memory.json` (`project`, `scopes`), `PI_MEMORY_SCOPES`, and the
+  `/memory` command (`scope`, `scopes`, `migrate`) configure the scope set;
+  precedence is command > env > project config > default.
+- Optional `scope` / `scopes` parameters on the memory tools. Writes go to the
+  own scope or `global`; reads default to the active set, may widen, and group
+  output per scope.
+- `/memory migrate` moves the previous flat layout into `global/` — plan by
+  default, `--apply` to execute, `--undo` to reverse from the manifest.
+- Injected context lists each scope separately and splits the 16K budget
+  equally across them; per-scope search results merge round-robin with
+  `[scope-id]` prefixes.
+- `memory_status` reports the per-scope directories and qmd collections, plus
+  orphaned collections and embedding chunks (`qmd cleanup` is suggested, never
+  run).
+
+### Changed
+
+- **`PI_MEMORY_DIR` is now the memory root**, the directory holding `global/`
+  and `projects/`, not a single scope directory. It is still honoured; pointing
+  it at a directory that contains `MEMORY.md` directly now warns once per
+  session.
+- **Upgrading does not move existing memory automatically.** Until
+  `/memory migrate --apply` runs, memory stays in the old flat location and is
+  not indexed. The plan output shows exactly what will move.
+
 ## [0.4.2] — 2026-08-10
 
 ### Added
