@@ -113,10 +113,12 @@ function cleanupTmpDir() {
 	fs.rmSync(tmpDir, { recursive: true, force: true });
 }
 
-/** Create a mock ExtensionAPI and capture registered tools/hooks. */
+/** Create a mock ExtensionAPI and capture registered tools/hooks/commands/messages. */
 function createMockPi() {
 	const tools: Record<string, any> = {};
 	const hooks: Record<string, (...args: unknown[]) => unknown> = {};
+	const commands: Record<string, { name: string; options: any }> = {};
+	const messages: Array<{ customType: string; content: unknown; display?: boolean }> = [];
 
 	const pi = {
 		registerTool(toolDef: any) {
@@ -125,9 +127,15 @@ function createMockPi() {
 		on(event: string, handler: (...args: unknown[]) => unknown) {
 			hooks[event] = handler;
 		},
+		registerCommand(name: string, options: any) {
+			commands[name] = { name, options };
+		},
+		sendMessage(message: { customType: string; content: unknown; display?: boolean }) {
+			messages.push(message);
+		},
 	};
 
-	return { pi, tools, hooks };
+	return { pi, tools, hooks, commands, messages };
 }
 
 /** Create a mock tool execution context. */
@@ -4520,5 +4528,147 @@ describe("scope-set change snapshot invalidation", () => {
 			true,
 		);
 		expect(fs.readdirSync(path.join(root, "projects")).sort()).toEqual(["chezmoi-d24458d5", "other-aaaa1111"]);
+	});
+});
+
+// ==========================================================================
+// 17. `/memory` command (spec §3.3)
+// ==========================================================================
+
+describe("/memory command", () => {
+	let root: string;
+	let projectDir: string;
+	let mockPi: ReturnType<typeof createMockPi>;
+
+	const commandCtx = () => ({
+		cwd: projectDir,
+		hasUI: false,
+		sessionManager: { getSessionId: () => "cmd0000000000001" },
+		ui: { notify: mock(() => {}) },
+	});
+
+	const runCommand = (args: string) => mockPi.commands.memory.options.handler(args, commandCtx());
+	const lastMessage = () => mockPi.messages[mockPi.messages.length - 1];
+	const lastContent = () => String(lastMessage().content);
+
+	beforeEach(async () => {
+		root = setupScopedRoot();
+		projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-cmd-proj-"));
+		_setMemoryRoot(root);
+		_resetMemorySnapshot();
+		_setQmdAvailable(false);
+		mockPi = createMockPi();
+		registerExtension(mockPi.pi as any);
+		await mockPi.hooks.session_start({}, commandCtx());
+		// The own scope directory normally exists by the time a user invokes
+		// the command (session_start creates it); make it visible to listings.
+		fs.mkdirSync(path.join(root, "projects", `${scopeSlug(projectDir)}-${scopeHash(projectDir)}`), {
+			recursive: true,
+		});
+	});
+
+	afterEach(() => {
+		delete process.env.PI_MEMORY_SCOPES;
+		_resetBaseDir();
+		_setQmdAvailable(false);
+		fs.rmSync(root, { recursive: true, force: true });
+		fs.rmSync(projectDir, { recursive: true, force: true });
+	});
+
+	test("registers a single /memory command", () => {
+		expect(Object.keys(mockPi.commands)).toEqual(["memory"]);
+		expect(mockPi.commands.memory.options.description).toBeTruthy();
+		expect(typeof mockPi.commands.memory.options.handler).toBe("function");
+	});
+
+	test("prints the report as a pi-memory custom message", async () => {
+		await runCommand("");
+
+		expect(lastMessage()).toMatchObject({ customType: "pi-memory", display: true });
+		const own = `project:${scopeSlug(projectDir)}`;
+		const configPath = path.join(projectDir, ".pi", "memory.json");
+		expect(lastContent()).toBe(`Scopes: ${own} (own)\nSource: default\nConfig: ${configPath} (not found)`);
+	});
+
+	test("an unknown verb prints a single-line usage listing the verbs", async () => {
+		await runCommand("bogus");
+
+		const content = lastContent();
+		expect(content).toContain('unknown /memory verb "bogus"');
+		expect(content).toContain("/memory scope");
+		expect(content).toContain("/memory scopes");
+		expect(content).toContain("/memory migrate");
+		expect(content.split("\n")).toHaveLength(1);
+	});
+
+	test("scope <id> sets a session-only override and changes the active set", async () => {
+		const own = `project:${scopeSlug(projectDir)}`;
+		await runCommand("scope project:other");
+
+		expect(lastContent()).toContain(`Scopes: ${own} (own), project:other`);
+		expect(lastContent()).toContain("Source: command");
+		// Session-only: nothing is written to the project's config file.
+		expect(fs.existsSync(path.join(projectDir, ".pi", "memory.json"))).toBe(false);
+	});
+
+	test("scope with no ids resets to the next layer down (env)", async () => {
+		process.env.PI_MEMORY_SCOPES = "project:other";
+		try {
+			await runCommand("scope project:other");
+			expect(lastContent()).toContain("Source: command");
+
+			await runCommand("scope");
+			expect(lastContent()).toContain("Source: env");
+			expect(lastContent()).toContain("project:other");
+		} finally {
+			delete process.env.PI_MEMORY_SCOPES;
+		}
+	});
+
+	test("an unknown id is reported and leaves the active set unchanged", async () => {
+		await runCommand("scope project:ghost");
+
+		expect(lastContent()).toContain('unknown scope id "project:ghost"');
+
+		await runCommand("");
+		const own = `project:${scopeSlug(projectDir)}`;
+		expect(lastContent()).toContain(`Scopes: ${own} (own)\n`);
+		expect(lastContent()).toContain("Source: default");
+	});
+
+	test("the override is cleared at session_start", async () => {
+		await runCommand("scope project:other");
+		expect(lastContent()).toContain("Source: command");
+
+		await mockPi.hooks.session_start({}, commandCtx());
+		await runCommand("");
+
+		expect(lastContent()).toContain("Source: default");
+		expect(lastContent()).not.toContain("project:other");
+	});
+
+	test("scopes lists every known scope, marking the own and active ones", async () => {
+		await runCommand("scopes");
+
+		const content = lastContent();
+		const lines = content.split("\n").filter((line) => line.startsWith("- "));
+		expect(lines).toHaveLength(4);
+		expect(lines).toContain("- global");
+		expect(lines).toContain("- project:chezmoi");
+		expect(lines).toContain("- project:other");
+		const ownLine = lines.find((line) => line.includes(`project:${scopeSlug(projectDir)}`));
+		expect(ownLine).toContain("(own)");
+		expect(ownLine).toContain("(active)");
+	});
+
+	test("migrate delegates to runMemoryMigrate and reports the exit code", async () => {
+		await runCommand("migrate --bogus");
+
+		expect(lastContent()).toContain("unknown option: --bogus");
+		expect(lastContent()).toContain("usage: /memory migrate");
+		expect(lastContent()).toContain("(exit 2)");
+
+		await runCommand("");
+		expect(lastContent()).toContain("Source: default");
 	});
 });

@@ -73,6 +73,10 @@ let ownScopeId = "global";
 let ownScopeDirOverride: string | null = null;
 let activeScopeSet: string[] = ["global"];
 
+// Session-only `/memory scope` override. It is never persisted; the durable
+// record is `.pi/memory.json`. session_start clears it.
+let commandScopes: string[] | null = null;
+
 function defaultOwnScopeDir(): string {
 	const parsed = parseScopeId(ownScopeId);
 	if (parsed && parsed.kind === "global") return path.join(memoryRoot, "global");
@@ -94,7 +98,7 @@ function applyOwnScope(scopeId: string, dir: string | null) {
 }
 
 function applySessionScopeSet(projectRoot: string) {
-	const resolved = resolveScopeSet(projectRoot);
+	const resolved = resolveScopeSet(projectRoot, { commandScopes: commandScopes ?? undefined });
 	const parsed = parseScopeId(resolved.ownScope);
 	const ownDir =
 		parsed && parsed.kind === "project"
@@ -2185,6 +2189,31 @@ export function applyScopeSetChange(extraScopes: string[]): void {
 	else if (mode === "refresh") snapshotDirty = true;
 }
 
+const MEMORY_USAGE =
+	"usage: /memory (report) | /memory scope [<id>...] | /memory scopes | /memory migrate [--apply] [--undo]";
+
+/**
+ * The `/memory` report (spec §3.3): the active set in set order with the own
+ * scope marked, the layer that supplied the extras, and the config file.
+ */
+function buildScopeReport(projectRoot: string): string {
+	const resolved = resolveScopeSet(projectRoot, { commandScopes: commandScopes ?? undefined });
+	const own = displayScopeId(ownScopeId);
+	const scopes = activeScopeSet
+		.map((id) => {
+			const display = displayScopeId(id);
+			return display === own ? `${display} (own)` : display;
+		})
+		.join(", ");
+	const configPath = path.join(projectRoot, ".pi", "memory.json");
+	const config = fs.existsSync(configPath) ? configPath : `${configPath} (not found)`;
+	return [
+		`Scopes: ${scopes}`,
+		`Source: ${commandScopes !== null ? "command" : resolved.source}`,
+		`Config: ${config}`,
+	].join("\n");
+}
+
 // ---------------------------------------------------------------------------
 // Extension entry point
 // ---------------------------------------------------------------------------
@@ -2949,9 +2978,93 @@ export async function runMemoryMigrate(args: string[]): Promise<{ text: string; 
 }
 
 export default function (pi: ExtensionAPI) {
+	// --- /memory: report, session-only scope override, scope listing, migration ---
+	pi.registerCommand("memory", {
+		description: "Show the active memory scopes or change them for this session",
+		handler: async (args, ctx) => {
+			const tokens = args.trim().split(/\s+/).filter(Boolean);
+			const send = (text: string) => pi.sendMessage({ customType: "pi-memory", content: text, display: true });
+			const projectRoot = projectRootFor(ctx.cwd);
+			const errorText = (err: unknown) => (err instanceof Error ? err.message : String(err));
+
+			if (tokens.length === 0) {
+				send(buildScopeReport(projectRoot));
+				return;
+			}
+
+			const [verb, ...rest] = tokens;
+
+			if (verb === "scope") {
+				if (rest.length === 0) {
+					// Reset to the next layer down (env, config, default).
+					commandScopes = null;
+					try {
+						const resolved = resolveScopeSet(projectRoot);
+						applyScopeSetChange(resolved.extraScopes);
+					} catch (err) {
+						send(errorText(err));
+						return;
+					}
+					send(buildScopeReport(projectRoot));
+					return;
+				}
+
+				// Resolve every id before touching state: an unknown or ambiguous
+				// id leaves both the override and the active set unchanged.
+				let ids: string[];
+				try {
+					const known = listKnownScopes(memoryRoot);
+					ids = [];
+					for (const ref of rest) {
+						const id = resolveScopeReference(ref, known);
+						if (!ids.includes(id)) ids.push(id);
+					}
+				} catch (err) {
+					send(errorText(err));
+					return;
+				}
+				try {
+					applyScopeSetChange(ids);
+					commandScopes = ids;
+				} catch (err) {
+					send(errorText(err));
+					return;
+				}
+				send(buildScopeReport(projectRoot));
+				return;
+			}
+
+			if (verb === "scopes") {
+				const own = displayScopeId(ownScopeId);
+				const active = new Set(activeScopeSet.map(displayScopeId));
+				const lines = ["Known scopes:"];
+				for (const id of listKnownScopes(memoryRoot)) {
+					const display = displayScopeId(id);
+					const markers: string[] = [];
+					if (display === own) markers.push("(own)");
+					if (active.has(display)) markers.push("(active)");
+					lines.push(`- ${display}${markers.length > 0 ? ` ${markers.join(" ")}` : ""}`);
+				}
+				send(lines.join("\n"));
+				return;
+			}
+
+			if (verb === "migrate") {
+				const result = await runMemoryMigrate(rest);
+				send(result.code === 0 ? result.text : `${result.text}\n(exit ${result.code})`);
+				return;
+			}
+
+			send(`unknown /memory verb "${verb}"; ${MEMORY_USAGE}`);
+		},
+	});
+
 	// --- session_start: detect qmd, auto-setup collection ---
 	pi.on("session_start", async (_event, ctx) => {
 		exitSummaryReason = null;
+		// The command layer is session-only: every session starts at the next
+		// layer down (env, config, default).
+		commandScopes = null;
 		// Scope identity is path-bound and resolution happens here, from the
 		// session's cwd — never from process.cwd() (the launch dir).
 		const cwd = typeof ctx.cwd === "string" ? ctx.cwd.trim() : "";
