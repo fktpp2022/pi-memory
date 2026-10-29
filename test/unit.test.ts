@@ -52,6 +52,7 @@ import {
 	isExitSummaryEnabled,
 	listKnownScopes,
 	loadProjectConfig,
+	memoryDirWarning,
 	movePathSync,
 	nowTimestamp,
 	parseQmdCollectionList,
@@ -4670,5 +4671,197 @@ describe("/memory command", () => {
 
 		await runCommand("");
 		expect(lastContent()).toContain("Source: default");
+	});
+});
+
+// ==========================================================================
+// 18. PI_MEMORY_DIR points at the memory root (§8.4)
+// ==========================================================================
+
+describe("PI_MEMORY_DIR points at the memory root", () => {
+	let envDir: string;
+	let projectDir: string;
+	let envBefore: string | undefined;
+
+	const setEnv = (value: string | undefined) => {
+		if (value === undefined) delete process.env.PI_MEMORY_DIR;
+		else process.env.PI_MEMORY_DIR = value;
+	};
+
+	const withEnv = async (value: string | undefined, fn: () => Promise<void> | void) => {
+		setEnv(value);
+		try {
+			await fn();
+		} finally {
+			setEnv(envBefore);
+		}
+	};
+
+	const makeSession = (sessionId: string) => {
+		const mockPi = createMockPi();
+		registerExtension(mockPi.pi as any);
+		const ctx = {
+			cwd: projectDir,
+			hasUI: false,
+			sessionManager: { getSessionId: () => sessionId },
+			ui: { notify: () => {} },
+		};
+		return { mockPi, ctx };
+	};
+
+	const warningsIn = (messages: Array<{ content: unknown }>) =>
+		messages.filter((message) => String(message.content).includes("PI_MEMORY_DIR"));
+
+	beforeEach(() => {
+		envBefore = process.env.PI_MEMORY_DIR;
+		envDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-envdir-"));
+		projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-envproj-"));
+		_resetBaseDir();
+		_resetMemorySnapshot();
+		_setQmdAvailable(false);
+	});
+
+	afterEach(() => {
+		setEnv(envBefore);
+		_resetBaseDir();
+		_setQmdAvailable(false);
+		fs.rmSync(envDir, { recursive: true, force: true });
+		fs.rmSync(projectDir, { recursive: true, force: true });
+	});
+
+	test("is silent when PI_MEMORY_DIR is unset", async () => {
+		await withEnv(undefined, () => {
+			expect(memoryDirWarning()).toBeNull();
+		});
+	});
+
+	test("is silent for a root-shaped directory (no MEMORY.md directly)", async () => {
+		fs.mkdirSync(path.join(envDir, "global"), { recursive: true });
+		fs.mkdirSync(path.join(envDir, "projects", "other-aaaa1111"), { recursive: true });
+		fs.writeFileSync(path.join(envDir, "global", "MEMORY.md"), "global memory\n");
+
+		await withEnv(envDir, () => {
+			expect(memoryDirWarning()).toBeNull();
+		});
+	});
+
+	test("is silent for a nonexistent directory", async () => {
+		await withEnv(path.join(envDir, "does-not-exist"), () => {
+			expect(memoryDirWarning()).toBeNull();
+		});
+	});
+
+	test("warns when the directory contains MEMORY.md directly", async () => {
+		fs.writeFileSync(path.join(envDir, "MEMORY.md"), "# Memory\n");
+
+		await withEnv(envDir, () => {
+			const warning = memoryDirWarning();
+			expect(warning).not.toBeNull();
+			expect(warning ?? "").toContain(envDir);
+			expect(warning ?? "").toContain("MEMORY.md");
+			expect(warning ?? "").toContain("scope");
+			expect(warning ?? "").toContain("memory root");
+			expect(warning ?? "").toContain("/memory migrate");
+		});
+	});
+
+	test("session_start warns once per session", async () => {
+		fs.writeFileSync(path.join(envDir, "MEMORY.md"), "# Memory\n");
+
+		await withEnv(envDir, async () => {
+			_resetBaseDir();
+			const { mockPi, ctx } = makeSession("warnsession00001");
+
+			await mockPi.hooks.session_start({}, ctx);
+			await mockPi.hooks.session_start({}, ctx);
+
+			const warnings = warningsIn(mockPi.messages);
+			expect(warnings).toHaveLength(1);
+			expect(warnings[0]).toMatchObject({ customType: "pi-memory", display: true });
+			expect(String(warnings[0].content)).toContain(envDir);
+		});
+	});
+
+	test("a fresh session_start re-arms the warning", async () => {
+		fs.writeFileSync(path.join(envDir, "MEMORY.md"), "# Memory\n");
+
+		await withEnv(envDir, async () => {
+			_resetBaseDir();
+			const { mockPi, ctx } = makeSession("warnsession00001");
+			await mockPi.hooks.session_start({}, ctx);
+
+			const fresh = { ...ctx, sessionManager: { getSessionId: () => "warnsession00002" } };
+			await mockPi.hooks.session_start({}, fresh);
+
+			expect(warningsIn(mockPi.messages)).toHaveLength(2);
+		});
+	});
+
+	test("memory_status names the root and warns only for a scope-shaped dir", async () => {
+		fs.writeFileSync(path.join(envDir, "MEMORY.md"), "# Memory\n");
+
+		await withEnv(envDir, async () => {
+			_setMemoryRoot(envDir);
+			const { mockPi } = makeSession("status00000000001");
+			const result = await mockPi.tools.memory_status.execute("c1", {}, null, null, createMockCtx());
+			const text = result.content[0].text;
+
+			expect(text).toContain(`- PI_MEMORY_DIR: set (${envDir})`);
+			expect(text).toContain(`  - ⚠ PI_MEMORY_DIR is set to "${envDir}"`);
+		});
+	});
+
+	test("memory_status omits the warning for a root-shaped dir", async () => {
+		await withEnv(envDir, async () => {
+			_setMemoryRoot(envDir);
+			const { mockPi } = makeSession("status00000000002");
+			const result = await mockPi.tools.memory_status.execute("c1", {}, null, null, createMockCtx());
+			const text = result.content[0].text;
+
+			expect(text).toContain(`- PI_MEMORY_DIR: set (${envDir})`);
+			expect(text).not.toContain("⚠");
+		});
+	});
+
+	test("memory_status keeps the default line when PI_MEMORY_DIR is unset", async () => {
+		await withEnv(undefined, async () => {
+			_setBaseDir(envDir);
+			const { mockPi } = makeSession("status00000000003");
+			const result = await mockPi.tools.memory_status.execute("c1", {}, null, null, createMockCtx());
+
+			expect(result.content[0].text).toContain("- PI_MEMORY_DIR: default");
+			expect(result.content[0].text).not.toContain("⚠");
+		});
+	});
+
+	test("/memory appends a Warning line only for a scope-shaped dir", async () => {
+		fs.writeFileSync(path.join(envDir, "MEMORY.md"), "# Memory\n");
+
+		await withEnv(envDir, async () => {
+			_resetBaseDir();
+			const { mockPi, ctx } = makeSession("reportsession00001");
+			await mockPi.hooks.session_start({}, ctx);
+			await mockPi.commands.memory.options.handler("", ctx);
+
+			const content = String(mockPi.messages[mockPi.messages.length - 1].content);
+			const lines = content.split("\n");
+			expect(lines).toHaveLength(4);
+			expect(lines.slice(0, 3).map((line) => line.split(":")[0])).toEqual(["Scopes", "Source", "Config"]);
+			expect(lines[3]).toBe(`Warning: ${memoryDirWarning()}`);
+			expect(lines[3]).toContain(envDir);
+		});
+	});
+
+	test("/memory omits the Warning line for a root-shaped dir", async () => {
+		await withEnv(envDir, async () => {
+			_resetBaseDir();
+			const { mockPi, ctx } = makeSession("reportsession00002");
+			await mockPi.hooks.session_start({}, ctx);
+			await mockPi.commands.memory.options.handler("", ctx);
+
+			const content = String(mockPi.messages[mockPi.messages.length - 1].content);
+			expect(content.split("\n")).toHaveLength(3);
+			expect(content).not.toContain("Warning:");
+		});
 	});
 });

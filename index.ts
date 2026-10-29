@@ -60,6 +60,25 @@ export function resolveMemoryDir(env: MemoryEnv = process.env): string {
 	return path.join(home, ".pi", "agent", "memory");
 }
 
+/**
+ * Spec §8.4: `PI_MEMORY_DIR` is the memory root (the directory holding
+ * `global/` and `projects/`), not a single scope. A directory that contains
+ * `MEMORY.md` directly is scope-shaped — the old memory-scope extension's
+ * layout — so it is warned about, but still honoured as an override.
+ *
+ * Returns `null` when the variable is unset or the directory is root-shaped
+ * (including a missing or empty directory).
+ */
+export function memoryDirWarning(dir: string | undefined = process.env.PI_MEMORY_DIR): string | null {
+	if (!dir) return null;
+	if (!fs.existsSync(path.join(dir, "MEMORY.md"))) return null;
+	return (
+		`PI_MEMORY_DIR is set to "${dir}", which contains MEMORY.md directly: this looks like a memory scope ` +
+		"directory. PI_MEMORY_DIR now points at the memory root (the directory holding global/ and projects/). " +
+		"Point it at the parent root, or run /memory migrate."
+	);
+}
+
 let MEMORY_DIR = resolveMemoryDir();
 let MEMORY_FILE = path.join(MEMORY_DIR, "MEMORY.md");
 let SCRATCHPAD_FILE = path.join(MEMORY_DIR, "SCRATCHPAD.md");
@@ -76,6 +95,11 @@ let activeScopeSet: string[] = ["global"];
 // Session-only `/memory scope` override. It is never persisted; the durable
 // record is `.pi/memory.json`. session_start clears it.
 let commandScopes: string[] | null = null;
+
+// Spec §8.4: the PI_MEMORY_DIR misconfiguration warning is emitted at most
+// once per session. The session id keys the guard, so a fresh session_start
+// re-arms it while a repeat emit for the same session stays silent.
+let memoryDirWarnedSession: string | null = null;
 
 function defaultOwnScopeDir(): string {
 	const parsed = parseScopeId(ownScopeId);
@@ -120,6 +144,7 @@ export function _resetBaseDir() {
 	memoryRoot = resolveMemoryDir();
 	applyOwnScope("global", null);
 	activeScopeSet = ["global"];
+	memoryDirWarnedSession = null;
 }
 
 /** Point at a memory root (the directory holding global/ and projects/) for testing. */
@@ -2207,11 +2232,14 @@ function buildScopeReport(projectRoot: string): string {
 		.join(", ");
 	const configPath = path.join(projectRoot, ".pi", "memory.json");
 	const config = fs.existsSync(configPath) ? configPath : `${configPath} (not found)`;
-	return [
+	const lines = [
 		`Scopes: ${scopes}`,
 		`Source: ${commandScopes !== null ? "command" : resolved.source}`,
 		`Config: ${config}`,
-	].join("\n");
+	];
+	const dirWarning = memoryDirWarning();
+	if (dirWarning) lines.push(`Warning: ${dirWarning}`);
+	return lines.join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -3069,6 +3097,17 @@ export default function (pi: ExtensionAPI) {
 		// session's cwd — never from process.cwd() (the launch dir).
 		const cwd = typeof ctx.cwd === "string" ? ctx.cwd.trim() : "";
 		if (cwd) applySessionScopeSet(projectRootFor(cwd));
+
+		// §8.4: PI_MEMORY_DIR stays an honoured override, but a scope-shaped
+		// directory means the user pointed it one level too deep. Warn once per
+		// session; never fail the session.
+		const sessionId = ctx.sessionManager?.getSessionId?.() ?? null;
+		const dirWarning = memoryDirWarning();
+		if (dirWarning && memoryDirWarnedSession !== sessionId) {
+			memoryDirWarnedSession = sessionId;
+			pi.sendMessage({ customType: "pi-memory", content: dirWarning, display: true });
+		}
+
 		if (terminalInputUnsubscribe) {
 			terminalInputUnsubscribe();
 			terminalInputUnsubscribe = null;
@@ -4140,6 +4179,8 @@ export default function (pi: ExtensionAPI) {
 				lines.push("", qmdInstallInstructions());
 			}
 
+			const dirWarning = memoryDirWarning();
+
 			lines.push(
 				"",
 				"## Configuration",
@@ -4147,7 +4188,8 @@ export default function (pi: ExtensionAPI) {
 				`- PI_MEMORY_QMD_UPDATE: ${getQmdUpdateMode()}`,
 				`- PI_MEMORY_QMD_SEARCH_TIMEOUT_MS: ${getQmdSearchTimeoutMs()}`,
 				`- PI_MEMORY_EMBED_PROBE_TIMEOUT_MS: ${getEmbedProbeTimeoutMs()}`,
-				`- PI_MEMORY_DIR: ${process.env.PI_MEMORY_DIR ? "set" : "default"}`,
+				`- PI_MEMORY_DIR: ${process.env.PI_MEMORY_DIR ? `set (${memoryRoot})` : "default"}`,
+				...(dirWarning ? [`  - ⚠ ${dirWarning}`] : []),
 				`- PI_MEMORY_EXIT_SUMMARY: ${isExitSummaryEnabled() ? "enabled" : "disabled"}`,
 				`- PI_MEMORY_EXIT_SUMMARY_MODEL: ${process.env.PI_MEMORY_EXIT_SUMMARY_MODEL?.trim() || "session model"}`,
 				`- PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT: ${getExitSummaryReasoningEffort() ?? "off"}`,
