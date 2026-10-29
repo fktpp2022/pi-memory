@@ -152,6 +152,14 @@ function createMockCtx(sessionId = "abcdef1234567890") {
 	};
 }
 
+/** Make a temp directory a git repo so sessions inside it get a project scope. */
+function initGitRepo(dir: string) {
+	const gitEnv = { ...process.env };
+	delete gitEnv.GIT_DIR;
+	delete gitEnv.GIT_WORK_TREE;
+	execFileSync("git", ["init", "-q", dir], { stdio: "ignore", env: gitEnv });
+}
+
 function createShutdownCtx(options?: {
 	sessionId?: string;
 	branch?: any[];
@@ -3217,14 +3225,16 @@ describe("session_start scope resolution", () => {
 	let projectDir: string;
 	let tools: Record<string, any>;
 	let hooks: Record<string, (...args: unknown[]) => unknown>;
+	let mockPi: ReturnType<typeof createMockPi>;
 
 	beforeEach(() => {
 		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-session-root-"));
 		projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-session-proj-"));
+		initGitRepo(projectDir);
 		_setMemoryRoot(root);
 		_resetMemorySnapshot();
 		_setQmdAvailable(false);
-		const mockPi = createMockPi();
+		mockPi = createMockPi();
 		tools = mockPi.tools;
 		hooks = mockPi.hooks;
 		registerExtension(mockPi.pi as any);
@@ -3282,6 +3292,65 @@ describe("session_start scope resolution", () => {
 		} finally {
 			fs.rmSync(repo, { recursive: true, force: true });
 		}
+	});
+
+	test("returns null outside any repository", () => {
+		const outside = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-session-norepo-"));
+		try {
+			expect(projectRootFor(outside)).toBeNull();
+		} finally {
+			fs.rmSync(outside, { recursive: true, force: true });
+		}
+	});
+
+	test("outside any repo the own scope is global", async () => {
+		const outside = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-session-norepo-"));
+		try {
+			await hooks.session_start({}, { ...sessionCtx(), cwd: outside });
+			await tools.memory_write.execute(
+				"c1",
+				{ target: "long_term", content: "Outside fact" },
+				null,
+				null,
+				createMockCtx("scope001234567890"),
+			);
+			expect(fs.readFileSync(path.join(root, "global", "MEMORY.md"), "utf-8")).toContain("Outside fact");
+		} finally {
+			fs.rmSync(outside, { recursive: true, force: true });
+		}
+	});
+
+	test("an unknown PI_MEMORY_SCOPES id is reported and the env layer is ignored", async () => {
+		process.env.PI_MEMORY_SCOPES = "global,project:ghost";
+		fs.mkdirSync(path.join(root, "global"), { recursive: true });
+		fs.writeFileSync(path.join(root, "global", "MEMORY.md"), "GLOBAL_ENV_CONTENT", "utf-8");
+
+		await hooks.session_start({}, sessionCtx());
+
+		const warning = mockPi.messages.find((message) => String(message.content).includes("PI_MEMORY_SCOPES"));
+		expect(warning).toMatchObject({ customType: "pi-memory", display: true });
+		expect(String(warning?.content)).toContain("project:ghost");
+		expect(String(warning?.content)).toContain("known scopes:");
+
+		const result = await tools.memory_read.execute("c1", { target: "long_term" }, null, null, {});
+		expect(result.content[0].text).not.toContain("## Scope: global");
+		expect(result.content[0].text).not.toContain("GLOBAL_ENV_CONTENT");
+	});
+
+	test("an untrusted project's config scopes are not applied", async () => {
+		fs.mkdirSync(path.join(projectDir, ".pi"), { recursive: true });
+		fs.writeFileSync(path.join(projectDir, ".pi", "memory.json"), JSON.stringify({ scopes: ["global"] }), "utf-8");
+		fs.mkdirSync(path.join(root, "global"), { recursive: true });
+		fs.writeFileSync(path.join(root, "global", "MEMORY.md"), "GLOBAL_UNTRUSTED_CONTENT", "utf-8");
+
+		await hooks.session_start({}, { ...sessionCtx(), isProjectTrusted: () => false });
+
+		const result = await tools.memory_read.execute("c1", { target: "long_term" }, null, null, {});
+		expect(result.content[0].text).not.toContain("GLOBAL_UNTRUSTED_CONTENT");
+
+		await mockPi.commands.memory.options.handler("", { ...sessionCtx(), isProjectTrusted: () => false });
+		const report = String(mockPi.messages[mockPi.messages.length - 1].content);
+		expect(report).toContain("Source: default");
 	});
 
 	test("PI_MEMORY_SCOPES extras join the active set", async () => {
@@ -3571,6 +3640,7 @@ describe("session_start collection lifecycle", () => {
 	beforeEach(() => {
 		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-lifecycle-root-"));
 		projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-lifecycle-proj-"));
+		initGitRepo(projectDir);
 		_setMemoryRoot(root);
 		_resetMemorySnapshot();
 		process.env.PI_MEMORY_SCOPES = "global";
@@ -3851,7 +3921,6 @@ describe("memory migration", () => {
 	test("plans a legacy layout as plain data without touching disk", () => {
 		const plan = planMemoryMigration({
 			memoryRoot: root,
-			extensionsDir: extDir,
 			qmdAvailable: true,
 			collections: { "pi-memory": root },
 		});
@@ -4185,7 +4254,7 @@ describe("per-scope injected context", () => {
 		expect(ctx).toContain("GLOBAL_SCOPE_MARKER");
 	});
 
-	test("keeps the declared extra order instead of forcing global last", () => {
+	test("puts global last even when the set lists it before a project scope", () => {
 		_setScopeSetForTest("project:chezmoi", ["global", "project:other"]);
 		fs.writeFileSync(path.join(ownDir(), "MEMORY.md"), "OWN", "utf-8");
 		fs.writeFileSync(path.join(globalDir(), "MEMORY.md"), "GLOBAL", "utf-8");
@@ -4196,8 +4265,25 @@ describe("per-scope injected context", () => {
 		const global = ctx.indexOf("## Scope: global");
 		const other = ctx.indexOf("## Scope: project:other");
 		expect(own).toBeGreaterThanOrEqual(0);
-		expect(global).toBeGreaterThan(own);
-		expect(other).toBeGreaterThan(global);
+		expect(other).toBeGreaterThan(own);
+		expect(global).toBeGreaterThan(other);
+	});
+
+	test("orders blocks own, then extra project scopes, then global", () => {
+		const dotfilesDir = path.join(root, "projects", "dotfiles-aaaa2222");
+		fs.mkdirSync(dotfilesDir, { recursive: true });
+		fs.writeFileSync(path.join(dotfilesDir, "MEMORY.md"), "DOTFILES_MARKER", "utf-8");
+		_setScopeSetForTest("project:chezmoi", ["global", "project:dotfiles"]);
+		fs.writeFileSync(path.join(ownDir(), "MEMORY.md"), "OWN_MARKER", "utf-8");
+		fs.writeFileSync(path.join(globalDir(), "MEMORY.md"), "GLOBAL_MARKER", "utf-8");
+
+		const ctx = buildMemoryContext();
+		const own = ctx.indexOf("## Scope: project:chezmoi");
+		const dotfiles = ctx.indexOf("## Scope: project:dotfiles");
+		const global = ctx.indexOf("## Scope: global");
+		expect(own).toBeGreaterThanOrEqual(0);
+		expect(dotfiles).toBeGreaterThan(own);
+		expect(global).toBeGreaterThan(dotfiles);
 	});
 
 	test("orders a scope's sub-sections scratchpad, today, MEMORY.md, yesterday", () => {
@@ -4407,6 +4493,132 @@ describe("per-scope search merge", () => {
 });
 
 // ==========================================================================
+// 18b. memory_search searches each resolved scope and groups the results
+// ==========================================================================
+
+describe("memory_search per-scope results", () => {
+	let root: string;
+	let tools: Record<string, any>;
+
+	const ownCollection = "chezmoi-d24458d5";
+
+	function stubScopedSearch(
+		registry: Record<string, string>,
+		hits: Record<string, Array<Record<string, unknown>>>,
+		stderr: Record<string, string> = {},
+	) {
+		const calls: string[][] = [];
+		_setExecFileForTest(((_file: string, args: string[], _opts: any, cb: any) => {
+			calls.push([...args]);
+			const [cmd, sub] = args;
+			if (cmd === "collection" && sub === "show") {
+				const dir = registry[args[2]];
+				if (dir) cb(null, `Collection: ${args[2]}\n  Path: ${dir}\n`, "");
+				else cb(new Error("exit 1"), "", `Collection not found: ${args[2]}\n`);
+				return;
+			}
+			if (cmd === "collection" && sub === "add") {
+				registry[args[4]] = path.resolve(args[2]);
+				cb(null, "", "");
+				return;
+			}
+			if (cmd === "search" || cmd === "vsearch" || cmd === "query") {
+				cb(null, JSON.stringify(hits[args[3]] ?? []), stderr[args[3]] ?? "");
+				return;
+			}
+			cb(null, "", "");
+		}) as any);
+		return calls;
+	}
+
+	const defaultRegistry = () => ({
+		[ownCollection]: path.join(root, "projects", ownCollection),
+		"pi-memory": path.join(root, "global"),
+	});
+
+	beforeEach(() => {
+		root = setupScopedRoot();
+		_setMemoryRoot(root);
+		_setScopeSetForTest("project:chezmoi", ["global"]);
+		_clearQmdStatusCaches();
+		_setQmdAvailable(true);
+		const mockPi = createMockPi();
+		tools = mockPi.tools;
+		registerExtension(mockPi.pi as any);
+	});
+
+	afterEach(() => {
+		_resetExecFileForTest();
+		_resetBaseDir();
+		_clearQmdStatusCaches();
+		_setQmdAvailable(false);
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	test("searches every resolved scope's collection and groups hits per scope", async () => {
+		const calls = stubScopedSearch(defaultRegistry(), {
+			[ownCollection]: [{ path: "own/1.md", score: 9, content: "OWN_HIT" }],
+			"pi-memory": [{ path: "global/1.md", score: 8, content: "GLOBAL_HIT" }],
+		});
+
+		const result = await tools.memory_search.execute("c1", { query: "lighthouse" }, null, null, {});
+		const text = String(result.content[0].text);
+
+		expect(text).toContain("## Scope: project:chezmoi");
+		expect(text).toContain("## Scope: global");
+		expect(text.indexOf("## Scope: project:chezmoi")).toBeLessThan(text.indexOf("## Scope: global"));
+		expect(text).toContain("### Result 1");
+		expect(text).toContain("**File:** own/1.md");
+		expect(text).toContain("OWN_HIT");
+		expect(text).toContain("GLOBAL_HIT");
+		expect(result.details.count).toBe(2);
+
+		const searches = calls.filter((args) => args[0] === "search");
+		expect(searches.map((args) => args[3]).sort()).toEqual([ownCollection, "pi-memory"].sort());
+		expect(searches.every((args) => args[6] === "lighthouse")).toBe(true);
+	});
+
+	test("does not require or create the global collection when global is not in the set", async () => {
+		_setScopeSetForTest("project:chezmoi");
+		const calls = stubScopedSearch({}, { [ownCollection]: [{ content: "OWN_ONLY" }] });
+
+		const result = await tools.memory_search.execute("c1", { query: "x" }, null, null, {});
+		const text = String(result.content[0].text);
+
+		expect(text).toContain("OWN_ONLY");
+		expect(text).not.toContain("## Scope: global");
+		expect(calls.some((args) => args.includes("pi-memory"))).toBe(false);
+		expect(calls.some((args) => args[0] === "collection" && args[1] === "add" && args[4] === ownCollection)).toBe(
+			true,
+		);
+	});
+
+	test("merges round-robin in scope order up to the overall limit", async () => {
+		stubScopedSearch(defaultRegistry(), {
+			[ownCollection]: [{ content: "OWN_1" }, { content: "OWN_2" }],
+			"pi-memory": [{ content: "GLOBAL_1" }],
+		});
+
+		const result = await tools.memory_search.execute("c1", { query: "x", limit: 2 }, null, null, {});
+		const text = String(result.content[0].text);
+
+		expect(result.details.count).toBe(2);
+		expect(text).toContain("OWN_1");
+		expect(text).toContain("GLOBAL_1");
+		expect(text).not.toContain("OWN_2");
+	});
+
+	test("reports needsEmbed when any scope reports missing embeddings", async () => {
+		stubScopedSearch(defaultRegistry(), {}, { [ownCollection]: "warning: need embeddings", "pi-memory": "" });
+
+		const result = await tools.memory_search.execute("c1", { query: "x", mode: "semantic" }, null, null, {});
+
+		expect(result.details.needsEmbed).toBe(true);
+		expect(result.details.count).toBe(0);
+	});
+});
+
+// ==========================================================================
 // 19. Scope-set changes invalidate the snapshot (spec 5.4)
 // ==========================================================================
 
@@ -4555,6 +4767,7 @@ describe("/memory command", () => {
 	beforeEach(async () => {
 		root = setupScopedRoot();
 		projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-cmd-proj-"));
+		initGitRepo(projectDir);
 		_setMemoryRoot(root);
 		_resetMemorySnapshot();
 		_setQmdAvailable(false);
@@ -4580,6 +4793,21 @@ describe("/memory command", () => {
 		expect(Object.keys(mockPi.commands)).toEqual(["memory"]);
 		expect(mockPi.commands.memory.options.description).toBeTruthy();
 		expect(typeof mockPi.commands.memory.options.handler).toBe("function");
+	});
+
+	test("argument completion offers verbs, then the existing scope ids", () => {
+		const complete = (prefix: string): Array<{ value: string }> | null =>
+			mockPi.commands.memory.options.getArgumentCompletions(prefix);
+
+		expect(complete("sc")?.map((item) => item.value)).toEqual(["scope", "scopes"]);
+		expect(complete("zzz")).toBeNull();
+		expect(complete("mig")?.map((item) => item.value)).toEqual(["migrate"]);
+
+		const scopeIds = complete("scope ")?.map((item) => item.value) ?? [];
+		expect(scopeIds).toContain("global");
+		expect(scopeIds).toContain("project:chezmoi");
+		expect(scopeIds).toContain("project:other");
+		expect(complete("scope project:o")?.map((item) => item.value)).toEqual(["project:other"]);
 	});
 
 	test("prints the report as a pi-memory custom message", async () => {
@@ -4794,6 +5022,22 @@ describe("PI_MEMORY_DIR points at the memory root", () => {
 			await mockPi.hooks.session_start({}, fresh);
 
 			expect(warningsIn(mockPi.messages)).toHaveLength(2);
+		});
+	});
+
+	test("warns once when the session has no session manager", async () => {
+		fs.writeFileSync(path.join(envDir, "MEMORY.md"), "# Memory\n");
+
+		await withEnv(envDir, async () => {
+			_resetBaseDir();
+			const mockPi = createMockPi();
+			registerExtension(mockPi.pi as any);
+			const ctx = { cwd: projectDir, hasUI: false, ui: { notify: () => {} } };
+
+			await mockPi.hooks.session_start({}, ctx);
+			await mockPi.hooks.session_start({}, ctx);
+
+			expect(warningsIn(mockPi.messages)).toHaveLength(1);
 		});
 	});
 
