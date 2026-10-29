@@ -96,10 +96,20 @@ let activeScopeSet: string[] = ["global"];
 // record is `.pi/memory.json`. session_start clears it.
 let commandScopes: string[] | null = null;
 
+// `ctx.isProjectTrusted()` captured at session_start, so /memory's report
+// resolves the config layer under the same trust decision as the session.
+let sessionTrusted: boolean | undefined;
+
+// Spec §3.2: an env layer naming an unknown scope id is ignored entirely and
+// warned about once at session_start.
+let scopeEnvWarning: string | null = null;
+
 // Spec §8.4: the PI_MEMORY_DIR misconfiguration warning is emitted at most
 // once per session. The session id keys the guard, so a fresh session_start
-// re-arms it while a repeat emit for the same session stays silent.
-let memoryDirWarnedSession: string | null = null;
+// re-arms it while a repeat emit for the same session stays silent. `undefined`
+// is the unset sentinel so a context without a session manager (session id
+// `null`) still differs on the first comparison.
+let memoryDirWarnedSession: string | null | undefined;
 
 function defaultOwnScopeDir(): string {
 	const parsed = parseScopeId(ownScopeId);
@@ -121,15 +131,49 @@ function applyOwnScope(scopeId: string, dir: string | null) {
 	syncOwnScopePaths();
 }
 
-function applySessionScopeSet(projectRoot: string) {
-	const resolved = resolveScopeSet(projectRoot, { commandScopes: commandScopes ?? undefined });
+function applySessionScopeSet(projectRoot: string | null, trusted?: boolean) {
+	sessionTrusted = trusted;
+	scopeEnvWarning = null;
+
+	// Outside any repo there is no project scope: the own scope is global,
+	// extras are empty, and there is no project config file (spec §1).
+	const resolved: ResolvedScopeSet =
+		projectRoot === null
+			? { ownScope: "global", extraScopes: [], scopes: ["global"], source: "default" }
+			: resolveScopeSet(projectRoot, { commandScopes: commandScopes ?? undefined, trusted });
+
+	// Validate the extras against the scopes that exist. Unknown ids never
+	// enter the active set, whichever layer supplied them.
+	const known = listKnownScopes(memoryRoot);
+	const extras: string[] = [];
+	const unknown: string[] = [];
+	for (const ref of resolved.extraScopes) {
+		try {
+			const id = resolveScopeReference(ref, known);
+			if (!extras.includes(id)) extras.push(id);
+		} catch {
+			unknown.push(ref);
+		}
+	}
+
+	let activeExtras = extras;
+	if (resolved.source === "env" && unknown.length > 0) {
+		// Spec §3.2: an unknown env id is an error; the env layer is ignored
+		// entirely (extras = empty) and the session continues.
+		scopeEnvWarning =
+			`PI_MEMORY_SCOPES names unknown scope id${unknown.length === 1 ? "" : "s"} ` +
+			`${unknown.map((id) => `"${id}"`).join(", ")}; known scopes: ${known.join(", ")}. ` +
+			"Ignoring PI_MEMORY_SCOPES for this session.";
+		activeExtras = [];
+	}
+
 	const parsed = parseScopeId(resolved.ownScope);
 	const ownDir =
 		parsed && parsed.kind === "project"
-			? path.join(memoryRoot, "projects", scopeDirName(parsed.slug as string, scopeHash(projectRoot)))
+			? path.join(memoryRoot, "projects", scopeDirName(parsed.slug as string, scopeHash(projectRoot as string)))
 			: path.join(memoryRoot, "global");
 	applyOwnScope(resolved.ownScope, ownDir);
-	activeScopeSet = [...resolved.scopes];
+	activeScopeSet = [resolved.ownScope, ...activeExtras];
 }
 
 /** Override base directory (for testing); this is the own scope's directory. */
@@ -144,7 +188,9 @@ export function _resetBaseDir() {
 	memoryRoot = resolveMemoryDir();
 	applyOwnScope("global", null);
 	activeScopeSet = ["global"];
-	memoryDirWarnedSession = null;
+	memoryDirWarnedSession = undefined;
+	sessionTrusted = undefined;
+	scopeEnvWarning = null;
 }
 
 /** Point at a memory root (the directory holding global/ and projects/) for testing. */
@@ -290,11 +336,11 @@ export function deriveOwnScope(projectRoot: string, slugOverride?: string): { sl
 }
 
 /**
- * Scope identity is anchored to the project root: the git root, else the cwd.
- * A session started in a subdirectory belongs to the repository's scope, not
- * to a scope of its own.
+ * Project root for a session: the git root, else `null` — outside any repo
+ * there is no project scope (spec §1). A session started in a subdirectory
+ * belongs to the repository's scope, not to a scope of its own.
  */
-export function projectRootFor(cwd: string): string {
+export function projectRootFor(cwd: string): string | null {
 	try {
 		// GIT_DIR/GIT_WORK_TREE are inherited from git hooks and would override -C.
 		const env = { ...process.env };
@@ -305,9 +351,9 @@ export function projectRootFor(cwd: string): string {
 			stdio: ["ignore", "pipe", "ignore"],
 			env,
 		}).trim();
-		return out ? path.resolve(out) : path.resolve(cwd);
+		return out ? path.resolve(out) : null;
 	} catch {
-		return path.resolve(cwd);
+		return null;
 	}
 }
 
@@ -1240,7 +1286,11 @@ interface ScopeContentSection {
 /** Active scope directories, own scope first, de-duplicated by directory. */
 function activeScopeDirs(): Array<{ id: string; dir: string }> {
 	const ctx = scopeContext();
-	const ordered = [ownScopeId, ...activeScopeSet.filter((id) => id !== ownScopeId)];
+	// Spec §5.1: own scope first, then the extra project scopes in set order,
+	// then `global` last — regardless of where the set lists it.
+	const extras = activeScopeSet.filter((id) => id !== ownScopeId);
+	const ordered = [ownScopeId, ...extras.filter((id) => id !== "global")];
+	if (extras.includes("global")) ordered.push("global");
 	const entries: Array<{ id: string; dir: string }> = [];
 	for (const id of ordered) {
 		const info = scopeInfoForId(id, ctx);
@@ -1910,6 +1960,37 @@ function formatSearchHit(result: QmdSearchResult, scopeId: string): string {
 	return `[${scopeId}] ${filePart}${text.trim()}`;
 }
 
+/** One `memory_search` hit block; numbering restarts per scope group. */
+function formatSearchResult(result: QmdSearchResult, index: number): string {
+	const parts: string[] = [`### Result ${index + 1}`];
+	const filePath = getQmdResultPath(result);
+	if (filePath) parts.push(`**File:** ${filePath}`);
+	if (result.score != null) parts.push(`**Score:** ${result.score}`);
+	const text = getQmdResultText(result);
+	if (text) parts.push(`\n${text}`);
+	return parts.join("\n");
+}
+
+/**
+ * Round-robin merge over per-scope hit lists in scope order: each scope
+ * contributes its next-best hit in turn until `limit` is reached. Each
+ * scope's internal order stays score-ranked.
+ */
+function mergeRoundRobin<T>(perScope: T[][], limit: number): T[] {
+	const merged: T[] = [];
+	for (let pass = 0; merged.length < limit; pass++) {
+		let added = false;
+		for (const hits of perScope) {
+			if (pass >= hits.length) continue;
+			merged.push(hits[pass]);
+			added = true;
+			if (merged.length >= limit) break;
+		}
+		if (!added) break;
+	}
+	return merged;
+}
+
 /**
  * Search every active scope separately and merge round-robin in set order.
  * A single union search applies its limit globally after the merge, so one
@@ -1959,17 +2040,7 @@ export async function searchRelevantMemories(prompt: string): Promise<string> {
 				.filter((snippet) => snippet.length > 0),
 		);
 
-		const merged: string[] = [];
-		for (let pass = 0; merged.length < RELEVANT_MEMORIES_LIMIT; pass++) {
-			let added = false;
-			for (const hits of perScope) {
-				if (pass >= hits.length) continue;
-				merged.push(hits[pass]);
-				added = true;
-				if (merged.length >= RELEVANT_MEMORIES_LIMIT) break;
-			}
-			if (!added) break;
-		}
+		const merged = mergeRoundRobin(perScope, RELEVANT_MEMORIES_LIMIT);
 
 		if (merged.length === 0) return "";
 		return merged.join("\n\n---\n\n");
@@ -2221,8 +2292,10 @@ const MEMORY_USAGE =
  * The `/memory` report (spec §3.3): the active set in set order with the own
  * scope marked, the layer that supplied the extras, and the config file.
  */
-function buildScopeReport(projectRoot: string): string {
-	const resolved = resolveScopeSet(projectRoot, { commandScopes: commandScopes ?? undefined });
+function buildScopeReport(projectRoot: string | null): string {
+	const resolved = projectRoot
+		? resolveScopeSet(projectRoot, { commandScopes: commandScopes ?? undefined, trusted: sessionTrusted })
+		: null;
 	const own = displayScopeId(ownScopeId);
 	const scopes = activeScopeSet
 		.map((id) => {
@@ -2230,16 +2303,52 @@ function buildScopeReport(projectRoot: string): string {
 			return display === own ? `${display} (own)` : display;
 		})
 		.join(", ");
-	const configPath = path.join(projectRoot, ".pi", "memory.json");
-	const config = fs.existsSync(configPath) ? configPath : `${configPath} (not found)`;
+	let config = "(outside a repo — no project config)";
+	if (projectRoot !== null) {
+		const configPath = path.join(projectRoot, ".pi", "memory.json");
+		config = fs.existsSync(configPath) ? configPath : `${configPath} (not found)`;
+	}
 	const lines = [
 		`Scopes: ${scopes}`,
-		`Source: ${commandScopes !== null ? "command" : resolved.source}`,
+		`Source: ${commandScopes !== null ? "command" : (resolved?.source ?? "default")}`,
 		`Config: ${config}`,
 	];
 	const dirWarning = memoryDirWarning();
 	if (dirWarning) lines.push(`Warning: ${dirWarning}`);
 	return lines.join("\n");
+}
+
+const MEMORY_VERBS = ["scope", "scopes", "migrate"];
+
+/**
+ * Scope ids offered as completions. The display form is used when it is
+ * unambiguous; a bare slug shared by two projects is offered hash-qualified
+ * so the completion can never supply an id the parser would reject.
+ */
+function scopeCompletionIds(): string[] {
+	const known = listKnownScopes(memoryRoot);
+	const displayCounts = new Map<string, number>();
+	for (const id of known) {
+		const display = displayScopeId(id);
+		if (display !== "global") displayCounts.set(display, (displayCounts.get(display) ?? 0) + 1);
+	}
+	const ids: string[] = [];
+	for (const id of known) {
+		const display = displayScopeId(id);
+		const value = display !== "global" && (displayCounts.get(display) ?? 0) > 1 ? id : display;
+		if (!ids.includes(value)) ids.push(value);
+	}
+	return ids;
+}
+
+/** Spec §3.3: verbs for the first token, existing scope ids for later ones. */
+function memoryArgumentCompletions(argumentPrefix: string): Array<{ value: string; label: string }> | null {
+	const trimmed = argumentPrefix.trimStart();
+	const firstToken = !/\s/.test(trimmed);
+	const current = firstToken ? trimmed : (trimmed.split(/\s+/).pop() ?? "");
+	const candidates = firstToken ? MEMORY_VERBS : scopeCompletionIds();
+	const matches = candidates.filter((candidate) => candidate.startsWith(current));
+	return matches.length > 0 ? matches.map((value) => ({ value, label: value })) : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -2391,22 +2500,18 @@ export type MigrateAction =
 
 export interface MigratePlanInput {
 	memoryRoot: string;
-	extensionsDir: string;
 	qmdAvailable: boolean;
 	/** Existing qmd collections: name -> indexed path. Absent when qmd is unavailable. */
 	collections?: Record<string, string | null>;
 }
 
 export interface MigratePlan {
-	mode: "migrate" | "undo";
 	memoryRoot: string;
 	qmdAvailable: boolean;
-	memoryScopePresent: boolean;
 	actions: MigrateAction[];
 	fileOperations: number;
 	collectionOperations: number;
 	conflicts: number;
-	hasRemovals: boolean;
 	alreadyMigrated: boolean;
 }
 
@@ -2462,25 +2567,16 @@ function planMoveAction(root: string, fromRel: string, toRel: string): MigrateMo
 	};
 }
 
-function buildMigratePlan(
-	mode: MigratePlan["mode"],
-	input: MigratePlanInput,
-	memoryScopePresent: boolean,
-	actions: MigrateAction[],
-	alreadyMigrated: boolean,
-): MigratePlan {
+function buildMigratePlan(input: MigratePlanInput, actions: MigrateAction[], alreadyMigrated: boolean): MigratePlan {
 	return {
-		mode,
 		memoryRoot: input.memoryRoot,
 		qmdAvailable: input.qmdAvailable,
-		memoryScopePresent,
 		actions,
 		fileOperations: actions.filter((action) => action.kind === "move" || action.kind === "keep").length,
 		collectionOperations: actions.filter(
 			(action) => action.kind === "removeCollection" || action.kind === "addCollection",
 		).length,
 		conflicts: actions.filter((action) => action.kind === "move" && action.conflict).length,
-		hasRemovals: actions.some((action) => action.kind === "removeCollection"),
 		alreadyMigrated,
 	};
 }
@@ -2493,7 +2589,6 @@ function buildMigratePlan(
 export function planMemoryMigration(input: MigratePlanInput): MigratePlan {
 	const root = input.memoryRoot;
 	const collections = input.collections ?? {};
-	const memoryScopePresent = fs.existsSync(path.join(input.extensionsDir, "memory-scope.ts"));
 	const actions: MigrateAction[] = [];
 
 	for (const entry of MIGRATION_FILE_ENTRIES) {
@@ -2516,7 +2611,7 @@ export function planMemoryMigration(input: MigratePlanInput): MigratePlan {
 	// Without qmd the collections cannot be inspected; a layout with no file
 	// work left is migrated as far as this command can tell.
 	if (!input.qmdAvailable && !hasFileWork) {
-		return buildMigratePlan("migrate", input, memoryScopePresent, actions, true);
+		return buildMigratePlan(input, actions, true);
 	}
 
 	const qmdStatus: MigrateActionStatus = input.qmdAvailable ? "pending" : "skipped";
@@ -2564,14 +2659,13 @@ export function planMemoryMigration(input: MigratePlanInput): MigratePlan {
 	}
 
 	const alreadyMigrated = !hasFileWork && collectionActions.length === 0;
-	return buildMigratePlan("migrate", input, memoryScopePresent, actions, alreadyMigrated);
+	return buildMigratePlan(input, actions, alreadyMigrated);
 }
 
 /** Pure planner for `--undo`: replay the manifest in reverse. */
 export function planMemoryUndo(input: MigratePlanInput, manifest: MigrationManifest): MigratePlan {
 	const root = input.memoryRoot;
 	const collections = input.collections ?? {};
-	const memoryScopePresent = fs.existsSync(path.join(input.extensionsDir, "memory-scope.ts"));
 	const actions: MigrateAction[] = [];
 
 	for (const move of [...manifest.moves].reverse()) {
@@ -2625,7 +2719,7 @@ export function planMemoryUndo(input: MigratePlanInput, manifest: MigrationManif
 
 	const hasMoveWork = actions.some((action) => action.kind === "move");
 	const alreadyMigrated = !hasMoveWork && collectionActions.length === 0;
-	return buildMigratePlan("undo", input, memoryScopePresent, actions, alreadyMigrated);
+	return buildMigratePlan(input, actions, alreadyMigrated);
 }
 
 export function readMigrationManifest(root: string): MigrationManifest | null {
@@ -2965,7 +3059,6 @@ export async function runMemoryMigrate(args: string[]): Promise<{ text: string; 
 	const qmdAvailable = await detectQmd();
 	const input: MigratePlanInput = {
 		memoryRoot: root,
-		extensionsDir,
 		qmdAvailable,
 		collections: qmdAvailable ? await readMigrationCollections(root) : {},
 	};
@@ -3009,6 +3102,7 @@ export default function (pi: ExtensionAPI) {
 	// --- /memory: report, session-only scope override, scope listing, migration ---
 	pi.registerCommand("memory", {
 		description: "Show the active memory scopes or change them for this session",
+		getArgumentCompletions: memoryArgumentCompletions,
 		handler: async (args, ctx) => {
 			const tokens = args.trim().split(/\s+/).filter(Boolean);
 			const send = (text: string) => pi.sendMessage({ customType: "pi-memory", content: text, display: true });
@@ -3027,8 +3121,8 @@ export default function (pi: ExtensionAPI) {
 					// Reset to the next layer down (env, config, default).
 					commandScopes = null;
 					try {
-						const resolved = resolveScopeSet(projectRoot);
-						applyScopeSetChange(resolved.extraScopes);
+						const resolved = projectRoot ? resolveScopeSet(projectRoot, { trusted: sessionTrusted }) : null;
+						applyScopeSetChange(resolved?.extraScopes ?? []);
 					} catch (err) {
 						send(errorText(err));
 						return;
@@ -3093,10 +3187,15 @@ export default function (pi: ExtensionAPI) {
 		// The command layer is session-only: every session starts at the next
 		// layer down (env, config, default).
 		commandScopes = null;
+		scopeEnvWarning = null;
+		sessionTrusted = undefined;
 		// Scope identity is path-bound and resolution happens here, from the
 		// session's cwd — never from process.cwd() (the launch dir).
 		const cwd = typeof ctx.cwd === "string" ? ctx.cwd.trim() : "";
-		if (cwd) applySessionScopeSet(projectRootFor(cwd));
+		if (cwd) {
+			const trusted = typeof ctx.isProjectTrusted === "function" ? ctx.isProjectTrusted() : undefined;
+			applySessionScopeSet(projectRootFor(cwd), trusted);
+		}
 
 		// §8.4: PI_MEMORY_DIR stays an honoured override, but a scope-shaped
 		// directory means the user pointed it one level too deep. Warn once per
@@ -3106,6 +3205,11 @@ export default function (pi: ExtensionAPI) {
 		if (dirWarning && memoryDirWarnedSession !== sessionId) {
 			memoryDirWarnedSession = sessionId;
 			pi.sendMessage({ customType: "pi-memory", content: dirWarning, display: true });
+		}
+		// §3.2: a bad PI_MEMORY_SCOPES id never silently changes the set; the
+		// env layer was ignored and the user is told once, here.
+		if (scopeEnvWarning) {
+			pi.sendMessage({ customType: "pi-memory", content: scopeEnvWarning, display: true });
 		}
 
 		if (terminalInputUnsubscribe) {
@@ -3913,7 +4017,7 @@ export default function (pi: ExtensionAPI) {
 			"If the first search doesn't find what you need, try rephrasing or switching modes. " +
 			"Keyword mode is best for specific terms; semantic mode finds related concepts even with different wording.\n" +
 			"`scopes` is optional and defaults to the active scope set; it may name any existing scope (widening). " +
-			"Results are tagged with their scope id.",
+			"Results are grouped per scope under a `## Scope: <id>` heading; only scopes with hits appear.",
 		parameters: Type.Object({
 			query: Type.String({ description: "Search query" }),
 			mode: Type.Optional(
@@ -3955,42 +4059,40 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			let hasCollection = await checkCollection(GLOBAL_COLLECTION_NAME);
-			if (!hasCollection) {
-				// memory_search still targets the global collection; a project
-				// scope's collection is created at session start or on write.
-				const scopeState = scopeContext();
-				const globalScope: ScopeDirInfo =
-					scopeState.ownScope === "global"
-						? { id: "global", dir: scopeState.ownDir }
-						: { id: "global", dir: path.join(scopeState.memoryRoot, "global") };
-				const state = await ensureScopeCollection(globalScope);
-				hasCollection = state === "ready" || state === "created" || state === "repointed";
-			}
-			if (!hasCollection) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "Could not set up qmd pi-memory collection. Check that qmd is working and the memory directory exists.",
-						},
-					],
-					isError: true,
-					details: { scopes: scopeIds },
-				};
-			}
-
 			const mode = params.mode ?? "keyword";
 			const limit = clampSearchLimit(params.limit);
 
+			// Spec §4.2/§6.3: search each resolved scope's own collection. A
+			// scope whose directory or collection is unusable is skipped; the
+			// global collection is never required or created unless `global`
+			// is actually in the resolved set.
+			const searchable: Array<{ id: string; collection: string }> = [];
+			for (const scope of scopes) {
+				const state = await ensureScopeCollection({ id: scope.id, dir: scope.dir });
+				if (state !== "ready" && state !== "created" && state !== "repointed") continue;
+				const collection = collectionNameForScope(scope.id, scope.dir);
+				if (collection) searchable.push({ id: displayScopeId(scope.id), collection });
+			}
+
 			try {
-				const { results, stderr } = await runQmdSearch(mode, params.query, limit);
-				const needsEmbed = /need embeddings/i.test(stderr ?? "");
+				const perScopeResults =
+					searchable.length === 0
+						? []
+						: await Promise.all(
+								searchable.map((scope) => runQmdSearch(mode, params.query, limit, undefined, scope.collection)),
+							);
+				const stderr = perScopeResults.map((result) => result.stderr ?? "").join("\n");
+				const needsEmbed = /need embeddings/i.test(stderr);
 				// Self-heal: any "need embeddings" warning (even with partial
 				// results) kicks off an incremental background embed.
 				const embedStarted = needsEmbed ? ensureQmdEmbed() : false;
 
-				if (results.length === 0) {
+				const selected = mergeRoundRobin(
+					perScopeResults.map((result, scopeIndex) => result.results.map((hit) => ({ scopeIndex, hit }))),
+					limit,
+				);
+
+				if (selected.length === 0) {
 					if (needsEmbed && (mode === "semantic" || mode === "deep")) {
 						return {
 							content: [
@@ -4009,7 +4111,15 @@ export default function (pi: ExtensionAPI) {
 									].join("\n"),
 								},
 							],
-							details: { mode, query: params.query, scopes: scopeIds, count: 0, needsEmbed: true, embedStarted },
+							details: {
+								mode,
+								query: params.query,
+								scopes: scopeIds,
+								count: 0,
+								needsEmbed: true,
+								embedStarted,
+								scopeCounts: {},
+							},
 						};
 					}
 					return {
@@ -4019,25 +4129,32 @@ export default function (pi: ExtensionAPI) {
 								text: `No results found for "${params.query}" (mode: ${mode}).`,
 							},
 						],
-						details: { mode, query: params.query, scopes: scopeIds, count: 0, needsEmbed },
+						details: { mode, query: params.query, scopes: scopeIds, count: 0, needsEmbed, scopeCounts: {} },
 					};
 				}
 
-				const formatted = results
-					.map((r, i) => {
-						const parts: string[] = [`### Result ${i + 1}`];
-						const filePath = getQmdResultPath(r);
-						if (filePath) parts.push(`**File:** ${filePath}`);
-						if (r.score != null) parts.push(`**Score:** ${r.score}`);
-						const text = getQmdResultText(r);
-						if (text) parts.push(`\n${text}`);
-						return parts.join("\n");
+				const scopeCounts: Record<string, number> = {};
+				for (const scope of searchable) scopeCounts[scope.id] = 0;
+				for (const { scopeIndex } of selected) scopeCounts[searchable[scopeIndex].id]++;
+				const sections = searchable
+					.map((scope, scopeIndex) => {
+						const hits = selected
+							.filter((entry) => entry.scopeIndex === scopeIndex)
+							.map((entry, index) => formatSearchResult(entry.hit, index));
+						return hits.length > 0 ? `## Scope: ${scope.id}\n\n${hits.join("\n\n---\n\n")}` : "";
 					})
-					.join("\n\n---\n\n");
+					.filter(Boolean);
 
 				return {
-					content: [{ type: "text", text: formatted }],
-					details: { mode, query: params.query, scopes: scopeIds, count: results.length, needsEmbed },
+					content: [{ type: "text", text: sections.join("\n\n---\n\n") }],
+					details: {
+						mode,
+						query: params.query,
+						scopes: scopeIds,
+						count: selected.length,
+						needsEmbed,
+						scopeCounts,
+					},
 				};
 			} catch (err) {
 				return {
