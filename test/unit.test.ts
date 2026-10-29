@@ -37,17 +37,27 @@ import {
 	getQmdSearchTimeoutMs,
 	isExitSummaryEmpty,
 	isExitSummaryEnabled,
+	loadProjectConfig,
 	nowTimestamp,
+	// scope resolution
+	parseScopeId,
+	parseScopesEnv,
 	parseScratchpad,
 	probeEmbeddings,
+	projectScopeId,
 	qmdCollectionInstructions,
 	qmdInstallInstructions,
 	readFileSafe,
 	resolveMemoryDir,
 	resolveQmdJsPath,
+	resolveScopeReference,
+	resolveScopeSet,
 	runQmdSearch,
 	type ScratchpadItem,
 	scheduleQmdUpdate,
+	scopeDirName,
+	scopeHash,
+	scopeSlug,
 	scratchpadAdd,
 	scratchpadClearDone,
 	scratchpadToggle,
@@ -2561,4 +2571,258 @@ describe("probeEmbeddings", () => {
 		}) as any);
 		expect(await probeEmbeddings()).toBe("unknown");
 	}, 10_000);
+});
+
+// ==========================================================================
+// 14. Scope resolution (project-scoped memory: scope ids, slug/hash, layers)
+// ==========================================================================
+
+describe("scope ids", () => {
+	test("parseScopeId accepts global", () => {
+		expect(parseScopeId("global")).toEqual({ kind: "global", id: "global" });
+	});
+
+	test("parseScopeId accepts project:<slug>", () => {
+		expect(parseScopeId("project:dotfiles")).toEqual({
+			kind: "project",
+			id: "project:dotfiles",
+			slug: "dotfiles",
+			hash: undefined,
+		});
+	});
+
+	test("parseScopeId accepts project:<slug>#<hash>", () => {
+		expect(parseScopeId("project:dotfiles#abcd1234")).toEqual({
+			kind: "project",
+			id: "project:dotfiles#abcd1234",
+			slug: "dotfiles",
+			hash: "abcd1234",
+		});
+	});
+
+	test("parseScopeId rejects malformed ids", () => {
+		const bad = [
+			"",
+			"global ",
+			"GLOBAL",
+			"project:",
+			"project",
+			"project:foo bar",
+			"project:foo#",
+			"project:foo#xyz",
+			"project:foo#abcd12345",
+			"foo",
+		];
+		for (const id of bad) {
+			expect(parseScopeId(id)).toBeNull();
+		}
+	});
+});
+
+describe("slug + hash derivation", () => {
+	// The derivation is preserved verbatim from the memory-scope extension
+	// (spec 8.3): <slug>-<8 hex>, sha1 over the lowercased, forward-slash-
+	// normalised absolute project path.
+	test("scopeHash matches the memory-scope extension's rule", () => {
+		// sha1("d:/projects/pi-memory") first 8 hex; matches the on-disk
+		// pi-memory-fd22b830 directory the memory-scope extension created.
+		expect(scopeHash("D:\\Projects\\pi-memory")).toBe("fd22b830");
+	});
+
+	test("scopeHash is stable across separator spellings on one machine", () => {
+		expect(scopeHash("C:/Users/me/src/thing")).toBe(scopeHash("C:\\Users\\me\\src\\thing"));
+	});
+
+	test("scopeHash lowercases the path", () => {
+		expect(scopeHash("d:/projects/chezmoi")).toBe(scopeHash("D:/PROJECTS/Chezmoi"));
+	});
+
+	test("scopeSlug preserves the extension's rule: case kept, invalid runs collapse to _", () => {
+		// The memory-scope extension does slug = basename with
+		// /[^A-Za-z0-9._-]+/g -> "_"; case is NOT lowercased (spec 8.3 keeps the
+		// derivation verbatim; the existing Lenovo-94672f7c directory proves it).
+		expect(scopeSlug("C:\\Users\\Me\\My Thing")).toBe("My_Thing");
+		expect(scopeSlug("D:\\Projects\\pi-memory")).toBe("pi-memory");
+	});
+
+	test("projectScopeId builds the display form from slug and hash", () => {
+		expect(projectScopeId("chezmoi", "d24458d5")).toBe("project:chezmoi");
+	});
+
+	test("scopeDirName builds the directory name from slug and hash", () => {
+		expect(scopeDirName("chezmoi", "d24458d5")).toBe("chezmoi-d24458d5");
+	});
+});
+
+describe("project config file (.pi/memory.json)", () => {
+	let projectDir: string;
+
+	beforeEach(() => {
+		projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-cfg-"));
+	});
+
+	afterEach(() => {
+		fs.rmSync(projectDir, { recursive: true, force: true });
+	});
+
+	const writeConfig = (obj: unknown) => {
+		fs.mkdirSync(path.join(projectDir, ".pi"), { recursive: true });
+		fs.writeFileSync(path.join(projectDir, ".pi", "memory.json"), JSON.stringify(obj), "utf-8");
+	};
+
+	test("reads project and scopes keys", () => {
+		writeConfig({ project: "chezmoi", scopes: ["global", "project:dotfiles"] });
+		expect(loadProjectConfig(projectDir)).toEqual({ project: "chezmoi", scopes: ["global", "project:dotfiles"] });
+	});
+
+	test("returns null when the file is missing", () => {
+		expect(loadProjectConfig(projectDir)).toBeNull();
+	});
+
+	test("returns null when the file is malformed JSON", () => {
+		fs.mkdirSync(path.join(projectDir, ".pi"), { recursive: true });
+		fs.writeFileSync(path.join(projectDir, ".pi", "memory.json"), "{oops", "utf-8");
+		expect(loadProjectConfig(projectDir)).toBeNull();
+	});
+
+	test("ignores unknown keys", () => {
+		writeConfig({ project: "x", scopes: ["global"], whatever: 42 });
+		expect(loadProjectConfig(projectDir)).toEqual({ project: "x", scopes: ["global"] });
+	});
+
+	test("untrusted project contributes no config", () => {
+		writeConfig({ project: "evil", scopes: ["global"] });
+		expect(loadProjectConfig(projectDir, { trusted: false })).toBeNull();
+	});
+});
+
+describe("env parsing (PI_MEMORY_SCOPES)", () => {
+	test("trims, de-duplicates (first wins), preserves order", () => {
+		expect(parseScopesEnv(" global , project:dotfiles ,, project:dotfiles ,global ")).toEqual([
+			"global",
+			"project:dotfiles",
+		]);
+	});
+
+	test("whitespace-only yields an empty list", () => {
+		expect(parseScopesEnv("  ,  ")).toEqual([]);
+	});
+
+	test("empty string yields an empty list", () => {
+		expect(parseScopesEnv("")).toEqual([]);
+	});
+
+	test("colon is not a separator, no escaping exists", () => {
+		expect(parseScopesEnv("project:x")).toEqual(["project:x"]);
+	});
+});
+
+describe("scope-set resolution precedence", () => {
+	let projectDir: string;
+	const envKey = "PI_MEMORY_SCOPES";
+
+	beforeEach(() => {
+		projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-scope-"));
+		delete process.env[envKey];
+	});
+
+	afterEach(() => {
+		delete process.env[envKey];
+		fs.rmSync(projectDir, { recursive: true, force: true });
+	});
+
+	const writeConfig = (obj: unknown) => {
+		fs.mkdirSync(path.join(projectDir, ".pi"), { recursive: true });
+		fs.writeFileSync(path.join(projectDir, ".pi", "memory.json"), JSON.stringify(obj), "utf-8");
+	};
+
+	test("default: extras empty, own scope derived from the project root", () => {
+		const resolved = resolveScopeSet(projectDir, {});
+		expect(resolved.ownScope).toBe(projectScopeId(scopeSlug(projectDir), scopeHash(projectDir)));
+		expect(resolved.extraScopes).toEqual([]);
+		expect(resolved.scopes).toEqual([resolved.ownScope]);
+		expect(resolved.source).toBe("default");
+	});
+
+	test("config supplies extras", () => {
+		writeConfig({ scopes: ["global", "project:dotfiles"] });
+		const resolved = resolveScopeSet(projectDir, {});
+		expect(resolved.extraScopes).toEqual(["global", "project:dotfiles"]);
+		expect(resolved.source).toBe("config");
+	});
+
+	test("env overrides config", () => {
+		writeConfig({ scopes: ["project:from-config"] });
+		process.env[envKey] = "project:from-env";
+		const resolved = resolveScopeSet(projectDir, {});
+		expect(resolved.extraScopes).toEqual(["project:from-env"]);
+		expect(resolved.source).toBe("env");
+	});
+
+	test("command overrides env", () => {
+		writeConfig({ scopes: ["project:from-config"] });
+		process.env[envKey] = "project:from-env";
+		const resolved = resolveScopeSet(projectDir, { commandScopes: ["project:from-command"] });
+		expect(resolved.extraScopes).toEqual(["project:from-command"]);
+		expect(resolved.source).toBe("command");
+	});
+
+	test("present-but-empty command clears the extras", () => {
+		writeConfig({ scopes: ["global"] });
+		process.env[envKey] = "global";
+		const resolved = resolveScopeSet(projectDir, { commandScopes: [] });
+		expect(resolved.extraScopes).toEqual([]);
+		expect(resolved.source).toBe("command");
+	});
+
+	test("present-but-empty env clears the extras", () => {
+		writeConfig({ scopes: ["global"] });
+		process.env[envKey] = "";
+		const resolved = resolveScopeSet(projectDir, {});
+		expect(resolved.extraScopes).toEqual([]);
+		expect(resolved.source).toBe("env");
+	});
+
+	test("config project key overrides the derived slug", () => {
+		writeConfig({ project: "explicit-name" });
+		const resolved = resolveScopeSet(projectDir, {});
+		expect(resolved.ownScope).toBe(projectScopeId("explicit-name", scopeHash(projectDir)));
+	});
+
+	test("own scope is always present even when extras list excludes it", () => {
+		writeConfig({ scopes: ["global"] });
+		const resolved = resolveScopeSet(projectDir, {});
+		expect(resolved.scopes).toEqual([resolved.ownScope, "global"]);
+	});
+});
+
+describe("unknown scope ids", () => {
+	test("rejects an id that matches no known scope, listing the known ids", () => {
+		const known = ["global", "project:dotfiles", "project:chezmoi"];
+		expect(() => resolveScopeReference("project:nope", known)).toThrow(/project:nope/);
+		expect(() => resolveScopeReference("project:nope", known)).toThrow(/project:dotfiles/);
+	});
+
+	test("a bare slug matching one known project resolves to it", () => {
+		const known = ["global", "project:dotfiles"];
+		expect(resolveScopeReference("project:dotfiles", known)).toBe("project:dotfiles");
+	});
+
+	test("a bare slug matching several projects is an ambiguity error listing candidates with hashes", () => {
+		const known = ["global", "project:dotfiles#aaaa1111", "project:dotfiles#bbbb2222"];
+		let message = "";
+		try {
+			resolveScopeReference("project:dotfiles", known);
+		} catch (err) {
+			message = err instanceof Error ? err.message : String(err);
+		}
+		expect(message).toContain("project:dotfiles");
+		expect(message).toContain("aaaa1111");
+		expect(message).toContain("bbbb2222");
+	});
+
+	test("a hash-qualified reference resolves to the matching project", () => {
+		const known = ["global", "project:dotfiles#aaaa1111", "project:dotfiles#bbbb2222"];
+		expect(resolveScopeReference("project:dotfiles#bbbb2222", known)).toBe("project:dotfiles#bbbb2222");
+	});
 });
