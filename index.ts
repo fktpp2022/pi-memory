@@ -1208,13 +1208,6 @@ interface ScopeContentSection {
 	rendered: string;
 }
 
-/** The literal display form of a scope id (no hash), as tool parameters accept it. */
-function displayScopeId(id: string): string {
-	const parsed = parseScopeId(id);
-	if (!parsed) return id;
-	return parsed.kind === "global" ? "global" : projectScopeId(parsed.slug as string, parsed.hash);
-}
-
 /** Active scope directories, own scope first, de-duplicated by directory. */
 function activeScopeDirs(): Array<{ id: string; dir: string }> {
 	const ctx = scopeContext();
