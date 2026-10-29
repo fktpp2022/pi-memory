@@ -27,6 +27,13 @@ follows [Semantic Versioning](https://semver.org/).
 - `memory_status` reports the per-scope directories and qmd collections, plus
   orphaned collections and embedding chunks (`qmd cleanup` is suggested, never
   run).
+- **Interactive `/memory` panel.** Bare `/memory` in a TUI opens a picker-style
+  panel: arrows move, space or tab stage a scope, enter applies the staged set
+  or expands the `Status` row, and `esc` closes without applying. Rows list the
+  locked own scope, on-disk project scopes A→Z, `global` as an opt-in extra,
+  then `Status` (paths and qmd readiness) and `Migrate` (plan, confirm, apply).
+  Selections are session-only and never persisted; in print, JSON and RPC the
+  bare command still prints the report, and every verb is unchanged.
 
 ### Changed
 
