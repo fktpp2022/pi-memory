@@ -29,13 +29,17 @@ import {
 	_setMemoryRoot,
 	_setQmdAvailable,
 	_setScopeSetForTest,
+	activateMemoryPanelRow,
 	applyScopeSetChange,
 	buildMemoryContext,
+	buildMemoryPanelHeader,
+	buildMemoryPanelRows,
 	buildQmdEnv,
 	buildQmdSpawn,
 	clampSearchLimit,
 	collectCollectionDiagnostics,
 	collectionNameForScope,
+	createMemoryPanelState,
 	dailyPath,
 	dailyPathIn,
 	ensureDirs,
@@ -93,6 +97,7 @@ import {
 	serializeScratchpad,
 	shortSessionId,
 	todayStr,
+	toggleMemoryPanelRow,
 	yesterdayStr,
 } from "../index.js";
 
@@ -4900,6 +4905,117 @@ describe("/memory command", () => {
 		await runCommand("");
 		expect(lastContent()).toContain("Source: default");
 	});
+
+	const tuiCtx = (uiOverrides: Record<string, unknown> = {}) => ({
+		...commandCtx(),
+		mode: "tui",
+		hasUI: true,
+		ui: { notify: mock(() => {}), custom: mock(() => Promise.resolve(undefined)), ...uiOverrides },
+	});
+
+	test("bare invocation in TUI opens the panel instead of printing the report", async () => {
+		let factory: unknown;
+		const custom = mock((opened: unknown) => {
+			factory = opened;
+			return Promise.resolve(undefined);
+		});
+
+		await mockPi.commands.memory.options.handler("", tuiCtx({ custom }));
+
+		expect(custom).toHaveBeenCalledTimes(1);
+		expect(typeof factory).toBe("function");
+		expect(mockPi.messages).toHaveLength(0);
+	});
+
+	test("closing the panel without enter leaves the applied set untouched", async () => {
+		const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+		const tui = { requestRender: () => {} };
+		const keybindings = { matches: () => false };
+
+		await mockPi.commands.memory.options.handler(
+			"",
+			tuiCtx({
+				custom: mock((factory: any) => {
+					const component = factory(tui, theme, keybindings, () => {});
+					expect(typeof component.render).toBe("function");
+					expect(typeof component.handleInput).toBe("function");
+					return Promise.resolve(undefined);
+				}),
+			}),
+		);
+
+		await mockPi.commands.memory.options.handler("", { ...commandCtx(), mode: "print" });
+
+		expect(lastContent()).toContain("Source: default");
+		expect(lastContent()).not.toContain("project:other");
+	});
+
+	/** Open the panel and hand back its live component for key input. */
+	const openPanel = async () => {
+		let component: any;
+		const closed = mock(() => {});
+		const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+		await mockPi.commands.memory.options.handler(
+			"",
+			tuiCtx({
+				custom: mock((factory: any) => {
+					component = factory({ requestRender: () => {} }, theme, { matches: () => false }, closed);
+					return Promise.resolve(undefined);
+				}),
+			}),
+		);
+		return { component, closed };
+	};
+	const printReport = async () => {
+		await mockPi.commands.memory.options.handler("", { ...commandCtx(), mode: "print" });
+		return lastContent();
+	};
+
+	test("enter applies the staged set, reports source command, and keeps the panel open", async () => {
+		const { component, closed } = await openPanel();
+		component.handleInput("\u001b[B"); // down: the first project row (chezmoi)
+		component.handleInput("\t"); // tab stages it
+		component.handleInput("\r"); // enter applies
+
+		expect(closed).not.toHaveBeenCalled();
+		const report = await printReport();
+		expect(report).toContain("Source: command");
+		expect(report).toContain("project:chezmoi");
+	});
+
+	test("esc closes the panel and discards staged changes", async () => {
+		const { component, closed } = await openPanel();
+		component.handleInput("\u001b[B");
+		component.handleInput(" "); // space stages the same row
+		component.handleInput("\u001b"); // esc closes without applying
+
+		expect(closed).toHaveBeenCalledTimes(1);
+		const report = await printReport();
+		expect(report).toContain("Source: default");
+		expect(report).not.toContain("project:chezmoi");
+	});
+
+	test("bare invocation outside TUI (print, json, rpc) still prints the report", async () => {
+		for (const mode of ["print", "json", "rpc"] as const) {
+			const custom = mock(() => Promise.resolve(undefined));
+			await mockPi.commands.memory.options.handler("", {
+				...commandCtx(),
+				mode,
+				hasUI: mode === "rpc",
+				ui: { notify: mock(() => {}), custom },
+			});
+
+			expect(custom).not.toHaveBeenCalled();
+			expect(lastContent()).toContain(`Scopes: project:${scopeSlug(projectDir)} (own)`);
+		}
+	});
+
+	test("verbs keep printing their output in TUI mode", async () => {
+		await mockPi.commands.memory.options.handler("scopes", tuiCtx());
+
+		expect(lastContent()).toContain("Known scopes:");
+		expect(lastContent()).toContain("- project:other");
+	});
 });
 
 // ==========================================================================
@@ -5107,5 +5223,132 @@ describe("PI_MEMORY_DIR points at the memory root", () => {
 			expect(content.split("\n")).toHaveLength(3);
 			expect(content).not.toContain("Warning:");
 		});
+	});
+});
+
+// ==========================================================================
+// 19. `/memory` panel list state (pure functions)
+// ==========================================================================
+
+describe("/memory panel list state", () => {
+	const own = "project:app#11111111";
+	const known = ["global", "project:chezmoi#d24458d5", "project:other#aaaa1111", "project:app#11111111"];
+
+	test("pins the own scope first and locked, then projects A-Z, then global", () => {
+		const rows = buildMemoryPanelRows(createMemoryPanelState(own, known, [own]));
+
+		expect(rows.map((row) => row.scopeId)).toEqual([
+			own,
+			"project:chezmoi#d24458d5",
+			"project:other#aaaa1111",
+			"global",
+		]);
+		expect(rows[0]).toMatchObject({ locked: true, isOwn: true, staged: true });
+		expect(rows.slice(1).every((row) => !row.locked && !row.isOwn)).toBe(true);
+		expect(rows[1].label).toBe("project:chezmoi");
+		expect(rows[3].label).toBe("global");
+	});
+
+	test("outside a repo global is the locked own scope and is not listed twice", () => {
+		const rows = buildMemoryPanelRows(
+			createMemoryPanelState("global", ["global", "project:chezmoi#d24458d5"], ["global"]),
+		);
+
+		expect(rows.map((row) => row.label)).toEqual(["global", "project:chezmoi"]);
+		expect(rows[0]).toMatchObject({ locked: true, isOwn: true, staged: true });
+	});
+
+	test("hash-qualifies ambiguous project slugs and stages the full id", () => {
+		const ambiguous = ["global", "project:dotfiles#aaaa1111", "project:dotfiles#bbbb2222", "project:other#cccc3333"];
+		const rows = buildMemoryPanelRows(createMemoryPanelState("global", ambiguous, ["global"]));
+
+		expect(rows.map((row) => row.label)).toEqual([
+			"global",
+			"project:dotfiles#aaaa1111",
+			"project:dotfiles#bbbb2222",
+			"project:other",
+		]);
+		expect(rows.map((row) => row.scopeId)).toEqual(ambiguous);
+	});
+
+	test("staged reflects the active extras and never contains the own scope", () => {
+		const state = createMemoryPanelState(own, known, [own, "project:other#aaaa1111"]);
+		const rows = buildMemoryPanelRows(state);
+
+		expect(state.staged).toEqual(["project:other#aaaa1111"]);
+		expect(rows.map((row) => [row.label, row.staged])).toEqual([
+			["project:app", true],
+			["project:chezmoi", false],
+			["project:other", true],
+			["global", false],
+		]);
+	});
+
+	test("toggling an extra stages it without changing the applied state", () => {
+		const state = createMemoryPanelState(own, known, [own]);
+
+		const staged = toggleMemoryPanelRow(state, "project:chezmoi#d24458d5");
+		const rows = buildMemoryPanelRows(staged);
+
+		expect(staged.staged).toEqual(["project:chezmoi#d24458d5"]);
+		expect(rows.find((row) => row.scopeId === "project:chezmoi#d24458d5")?.staged).toBe(true);
+		// The original state is untouched: applying is a separate step.
+		expect(state.staged).toEqual([]);
+		expect(buildMemoryPanelRows(state).some((row) => row.staged && !row.isOwn)).toBe(false);
+	});
+
+	test("toggling a staged extra again unstages it", () => {
+		const state = createMemoryPanelState(own, known, [own, "project:chezmoi#d24458d5"]);
+
+		const staged = toggleMemoryPanelRow(state, "project:chezmoi#d24458d5");
+
+		expect(staged.staged).toEqual([]);
+		expect(buildMemoryPanelRows(staged).find((row) => row.scopeId === "project:chezmoi#d24458d5")?.staged).toBe(
+			false,
+		);
+	});
+
+	test("the own scope ignores toggling", () => {
+		const state = createMemoryPanelState(own, known, [own]);
+
+		expect(toggleMemoryPanelRow(state, own).staged).toEqual([]);
+		expect(buildMemoryPanelRows(toggleMemoryPanelRow(state, own))[0].staged).toBe(true);
+	});
+
+	test("toggling an unknown row leaves the staged set alone", () => {
+		const state = createMemoryPanelState(own, known, [own, "global"]);
+
+		expect(toggleMemoryPanelRow(state, "project:ghost#00000000").staged).toEqual(["global"]);
+	});
+
+	test("activating a scope row asks to apply the staged extras in row order", () => {
+		const state = createMemoryPanelState(own, known, [own]);
+		const staged = toggleMemoryPanelRow(
+			toggleMemoryPanelRow(state, "project:other#aaaa1111"),
+			"project:chezmoi#d24458d5",
+		);
+
+		expect(activateMemoryPanelRow(staged, "project:other#aaaa1111")).toEqual({
+			kind: "apply",
+			extraScopes: ["project:chezmoi#d24458d5", "project:other#aaaa1111"],
+		});
+	});
+
+	test("activating the own row applies the staged extras as well", () => {
+		const state = createMemoryPanelState(own, known, [own, "global"]);
+
+		expect(activateMemoryPanelRow(state, own)).toEqual({ kind: "apply", extraScopes: ["global"] });
+	});
+
+	test("activating an unknown row does nothing", () => {
+		const state = createMemoryPanelState(own, known, [own]);
+
+		expect(activateMemoryPanelRow(state, "project:ghost#00000000")).toEqual({ kind: "none" });
+	});
+
+	test("the header shows the active scopes, the own marker, and the memory root", () => {
+		const header = buildMemoryPanelHeader([own, "project:other#aaaa1111"], "/tmp/pi-memory-root");
+
+		expect(header.split("\n")).toEqual(["Scopes: project:app (own), project:other", "Root: /tmp/pi-memory-root"]);
 	});
 });

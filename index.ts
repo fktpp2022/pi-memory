@@ -35,10 +35,13 @@ import { complete } from "@earendil-works/pi-ai/compat";
 import {
 	convertToLlm,
 	type ExtensionAPI,
+	type ExtensionCommandContext,
 	type ExtensionContext,
 	type SessionEntry,
 	serializeConversation,
+	type Theme,
 } from "@earendil-works/pi-coding-agent";
+import { type Component, SelectList, type SelectListTheme } from "@earendil-works/pi-tui";
 
 // ---------------------------------------------------------------------------
 // Paths (mutable for testing via _setBaseDir / _resetBaseDir)
@@ -2352,6 +2355,294 @@ function memoryArgumentCompletions(argumentPrefix: string): Array<{ value: strin
 }
 
 // ---------------------------------------------------------------------------
+// /memory panel list state (pure; the TUI view is a thin shell over these)
+// ---------------------------------------------------------------------------
+
+/**
+ * Everything the panel needs to decide what a row does. Held as full scope ids
+ * so an ambiguous slug is addressed exactly; `staged` never contains the own
+ * scope, which is read-only.
+ */
+export interface MemoryPanelState {
+	ownScope: string;
+	known: string[];
+	staged: string[];
+}
+
+export interface MemoryPanelRow {
+	/** Full scope id: the value a toggle stages. */
+	scopeId: string;
+	/** Display id, hash-qualified when the bare slug is shared by two projects. */
+	label: string;
+	locked: boolean;
+	isOwn: boolean;
+	staged: boolean;
+}
+
+/** What activating a row asks the command layer to do. */
+export type MemoryPanelAction = { kind: "apply"; extraScopes: string[] } | { kind: "none" };
+
+/** Matcher for the own scope: exact when hash-qualified, display form otherwise. */
+function panelOwnScopeMatcher(ownScope: string): (id: string) => boolean {
+	const ownDisplay = displayScopeId(ownScope);
+	const parsed = parseScopeId(ownScope);
+	const hashQualified = ownScope === "global" || parsed?.hash !== undefined;
+	return (id) => id === ownScope || (!hashQualified && displayScopeId(id) === ownDisplay);
+}
+
+/**
+ * Label per known id, reusing the command-completion ambiguity rule: a bare
+ * project slug shared by two projects is rendered hash-qualified.
+ */
+function panelRowLabels(known: readonly string[]): Map<string, string> {
+	const displayCounts = new Map<string, number>();
+	for (const id of known) {
+		const display = displayScopeId(id);
+		if (display !== "global") displayCounts.set(display, (displayCounts.get(display) ?? 0) + 1);
+	}
+	const labels = new Map<string, string>();
+	for (const id of known) {
+		const display = displayScopeId(id);
+		labels.set(id, display !== "global" && (displayCounts.get(display) ?? 0) > 1 ? id : display);
+	}
+	return labels;
+}
+
+/** Start a panel session from the applied scope set; staged starts equal to it. */
+export function createMemoryPanelState(
+	ownScope: string,
+	known: readonly string[],
+	activeScopes: readonly string[],
+): MemoryPanelState {
+	const isOwn = panelOwnScopeMatcher(ownScope);
+	const staged: string[] = [];
+	for (const id of activeScopes) {
+		if (!isOwn(id) && !staged.includes(id)) staged.push(id);
+	}
+	return { ownScope, known: [...known], staged };
+}
+
+/**
+ * Row order: own scope pinned first and locked, project scopes A-Z, then
+ * `global` when it is not the own scope.
+ */
+export function buildMemoryPanelRows(state: MemoryPanelState): MemoryPanelRow[] {
+	const isOwn = panelOwnScopeMatcher(state.ownScope);
+	const labels = panelRowLabels(state.known);
+	const rows: MemoryPanelRow[] = [
+		{
+			scopeId: state.ownScope,
+			label: labels.get(state.ownScope) ?? displayScopeId(state.ownScope),
+			locked: true,
+			isOwn: true,
+			staged: true,
+		},
+	];
+
+	const projects = state.known
+		.filter((id) => id !== "global" && !isOwn(id))
+		.map((id) => ({ id, label: labels.get(id) ?? displayScopeId(id) }))
+		.sort((a, b) => a.label.localeCompare(b.label));
+	for (const project of projects) {
+		rows.push({
+			scopeId: project.id,
+			label: project.label,
+			locked: false,
+			isOwn: false,
+			staged: state.staged.includes(project.id),
+		});
+	}
+
+	if (state.ownScope !== "global" && state.known.includes("global")) {
+		rows.push({
+			scopeId: "global",
+			label: "global",
+			locked: false,
+			isOwn: false,
+			staged: state.staged.includes("global"),
+		});
+	}
+	return rows;
+}
+
+/**
+ * Flip a row's staged membership. The own scope and rows that do not exist
+ * are ignored. Staged extras keep row order, so applying is deterministic.
+ */
+export function toggleMemoryPanelRow(state: MemoryPanelState, scopeId: string): MemoryPanelState {
+	const row = buildMemoryPanelRows(state).find((candidate) => candidate.scopeId === scopeId);
+	if (!row || row.locked) return state;
+	const staged = row.staged
+		? state.staged.filter((id) => id !== scopeId)
+		: state.staged.filter((id) => id !== scopeId).concat(scopeId);
+	return { ...state, staged };
+}
+
+/**
+ * Enter on a scope row: apply the staged set. Extras come out in row order,
+ * which keeps the resulting set order stable regardless of toggle order.
+ */
+export function activateMemoryPanelRow(state: MemoryPanelState, scopeId: string): MemoryPanelAction {
+	const rows = buildMemoryPanelRows(state);
+	if (!rows.some((row) => row.scopeId === scopeId)) return { kind: "none" };
+	const extraScopes = rows.filter((row) => !row.isOwn && row.staged).map((row) => row.scopeId);
+	return { kind: "apply", extraScopes };
+}
+
+/**
+ * Header line(s): the active scope set with the own scope marked, plus the
+ * memory root. It is rebuilt from the applied set on every render, so applying
+ * a staged change shows the new set without reopening the panel.
+ */
+export function buildMemoryPanelHeader(activeScopes: readonly string[], memoryRoot: string): string {
+	const ownId = activeScopes[0];
+	const scopes = activeScopes
+		.map((id) => (id === ownId ? `${displayScopeId(id)} (own)` : displayScopeId(id)))
+		.join(", ");
+	return `Scopes: ${scopes}\nRoot: ${memoryRoot}`;
+}
+
+/** The own scope id qualified with its hash when the directory exists, for exact row addressing. */
+function panelOwnScopeId(): string {
+	if (ownScopeId === "global") return "global";
+	const known = listKnownScopes(memoryRoot);
+	const ownDir = path.resolve(MEMORY_DIR);
+	const matched = known.find((id) => {
+		const dir = scopeDirPath(memoryRoot, id);
+		return dir !== null && path.resolve(dir) === ownDir;
+	});
+	if (matched) return matched;
+	const ownDisplay = displayScopeId(ownScopeId);
+	const candidates = known.filter((id) => displayScopeId(id) === ownDisplay);
+	return candidates.length === 1 ? candidates[0] : ownScopeId;
+}
+
+function currentPanelState(): MemoryPanelState {
+	return createMemoryPanelState(panelOwnScopeId(), listKnownScopes(memoryRoot), activeScopeSet);
+}
+
+interface MemoryPanelActions {
+	/** Apply the staged extras; returns an error message when the apply failed. */
+	apply: (extraScopes: string[]) => string | null;
+	/** Rebuild the list state from the applied set after a successful apply. */
+	freshState: () => MemoryPanelState;
+	/** One-line header rebuilt from the applied set on every render. */
+	header: () => string;
+	notify: (message: string, type?: "info" | "warning" | "error") => void;
+	close: () => void;
+}
+
+/**
+ * Flat panel over the list state: arrows move through pi's SelectList, space
+ * and tab toggle the highlighted scope, enter applies, esc closes. The list is
+ * rebuilt on every state change (SelectList has no set-items API) and the
+ * highlighted row is restored by index.
+ */
+class MemoryPanelView implements Component {
+	private list: SelectList;
+	private state: MemoryPanelState;
+	private selectedIndex = 0;
+	private readonly theme: Theme;
+	private readonly actions: MemoryPanelActions;
+
+	constructor(theme: Theme, state: MemoryPanelState, actions: MemoryPanelActions) {
+		this.theme = theme;
+		this.state = state;
+		this.actions = actions;
+		this.list = this.buildList();
+	}
+
+	private selectListTheme(): SelectListTheme {
+		return {
+			selectedPrefix: (text) => this.theme.fg("accent", text),
+			selectedText: (text) => this.theme.fg("accent", text),
+			description: (text) => this.theme.fg("muted", text),
+			scrollInfo: (text) => this.theme.fg("dim", text),
+			noMatch: (text) => this.theme.fg("dim", text),
+		};
+	}
+
+	private buildList(): SelectList {
+		// Action rows (Status #26, Migrate #27) append here as further items.
+		const items = buildMemoryPanelRows(this.state).map((row) => ({
+			value: row.scopeId,
+			label: `${row.staged ? "[x]" : "[ ]"} ${row.label}${row.isOwn ? " (own)" : ""}`,
+			description: row.locked ? "locked: this session's scope" : undefined,
+		}));
+		const list = new SelectList(items, 10, this.selectListTheme());
+		list.setSelectedIndex(this.selectedIndex);
+		list.onSelect = (item) => this.activate(item.value);
+		list.onCancel = () => this.actions.close();
+		list.onSelectionChange = (item) => {
+			const index = items.findIndex((candidate) => candidate.value === item.value);
+			if (index >= 0) this.selectedIndex = index;
+		};
+		return list;
+	}
+
+	private rebuild() {
+		this.list = this.buildList();
+	}
+
+	private toggle(scopeId: string) {
+		const next = toggleMemoryPanelRow(this.state, scopeId);
+		if (next === this.state) return;
+		this.state = next;
+		this.rebuild();
+	}
+
+	private activate(scopeId: string) {
+		const action = activateMemoryPanelRow(this.state, scopeId);
+		if (action.kind !== "apply") return;
+		const error = this.actions.apply(action.extraScopes);
+		if (error) {
+			this.actions.notify(error, "error");
+			return;
+		}
+		this.state = this.actions.freshState();
+		this.rebuild();
+	}
+
+	handleInput(data: string): void {
+		if (data === " " || data === "\t") {
+			const selected = this.list.getSelectedItem();
+			if (selected) this.toggle(selected.value);
+			return;
+		}
+		this.list.handleInput(data);
+	}
+
+	render(width: number): string[] {
+		return [...this.actions.header().split("\n"), ...this.list.render(width)];
+	}
+
+	invalidate(): void {
+		this.list.invalidate();
+	}
+}
+
+/** Bare `/memory` in a TUI: the panel writes only the session's command layer. */
+async function openMemoryPanel(ctx: ExtensionCommandContext): Promise<void> {
+	await ctx.ui.custom<void>((_tui, theme, _keybindings, done) => {
+		return new MemoryPanelView(theme, currentPanelState(), {
+			apply: (extraScopes) => {
+				try {
+					applyScopeSetChange(extraScopes);
+					commandScopes = extraScopes;
+					return null;
+				} catch (err) {
+					return err instanceof Error ? err.message : String(err);
+				}
+			},
+			freshState: currentPanelState,
+			header: () => buildMemoryPanelHeader(activeScopeSet, memoryRoot),
+			notify: (message, type) => ctx.ui.notify(message, type),
+			close: () => done(undefined),
+		});
+	});
+}
+
+// ---------------------------------------------------------------------------
 // Extension entry point
 // ---------------------------------------------------------------------------
 
@@ -3110,6 +3401,12 @@ export default function (pi: ExtensionAPI) {
 			const errorText = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
 			if (tokens.length === 0) {
+				// Bare /memory is the only interactive entry point; everywhere
+				// else (print, JSON, RPC) it keeps printing the plain report.
+				if (ctx.mode === "tui") {
+					await openMemoryPanel(ctx);
+					return;
+				}
 				send(buildScopeReport(projectRoot));
 				return;
 			}
