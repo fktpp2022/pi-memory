@@ -243,6 +243,13 @@ export function projectScopeId(slug: string, _hash?: string): string {
 	return `project:${slug}`;
 }
 
+/** Display form of any known id: strips the hash, which is an addressing detail. */
+export function displayScopeId(id: string): string {
+	const parsed = parseScopeId(id);
+	if (!parsed || parsed.kind === "global") return id;
+	return projectScopeId(parsed.slug as string);
+}
+
 export function scopeDirName(slug: string, hash: string): string {
 	return `${slug}-${hash}`;
 }
@@ -2195,6 +2202,8 @@ interface ScopeReadResult {
 	text: string;
 	details: Record<string, unknown>;
 	isError?: boolean;
+	/** No content in this scope: grouped reads omit empty scopes instead of printing headings. */
+	empty?: boolean;
 }
 
 function readMemoryTarget(scopeDir: string, target: MemoryReadTarget, date?: string): ScopeReadResult {
@@ -2205,10 +2214,10 @@ function readMemoryTarget(scopeDir: string, target: MemoryReadTarget, date?: str
 				.filter((f) => f.endsWith(".md"))
 				.sort()
 				.reverse();
-			if (files.length === 0) return { text: "No daily logs found.", details: {} };
+			if (files.length === 0) return { text: "No daily logs found.", details: {}, empty: true };
 			return { text: `Daily logs:\n${files.map((f) => `- ${f}`).join("\n")}`, details: { files } };
 		} catch {
-			return { text: "No daily logs directory.", details: {} };
+			return { text: "No daily logs directory.", details: {}, empty: true };
 		}
 	}
 
@@ -2219,20 +2228,20 @@ function readMemoryTarget(scopeDir: string, target: MemoryReadTarget, date?: str
 		}
 		const filePath = dailyPathIn(scopeDir, d);
 		const content = readFileSafe(filePath);
-		if (!content) return { text: `No daily log for ${d}.`, details: {} };
+		if (!content) return { text: `No daily log for ${d}.`, details: {}, empty: true };
 		return { text: content, details: { path: filePath, date: d } };
 	}
 
 	if (target === "scratchpad") {
 		const filePath = path.join(scopeDir, "SCRATCHPAD.md");
 		const content = readFileSafe(filePath);
-		if (!content?.trim()) return { text: "SCRATCHPAD.md is empty or does not exist.", details: {} };
+		if (!content?.trim()) return { text: "SCRATCHPAD.md is empty or does not exist.", details: {}, empty: true };
 		return { text: content, details: { path: filePath } };
 	}
 
 	const filePath = path.join(scopeDir, "MEMORY.md");
 	const content = readFileSafe(filePath);
-	if (!content) return { text: "MEMORY.md is empty or does not exist.", details: {} };
+	if (!content) return { text: "MEMORY.md is empty or does not exist.", details: {}, empty: true };
 	return { text: content, details: { path: filePath } };
 }
 
@@ -2480,7 +2489,7 @@ export default function (pi: ExtensionAPI) {
 			"- 'long_term': Write to MEMORY.md (curated durable facts, decisions, preferences). Mode: 'append' or 'overwrite'.",
 			"- 'daily': Append to today's daily log (daily/<YYYY-MM-DD>.md). Always appends.",
 			"Use this when the user asks you to remember something, or when you learn important preferences/decisions.",
-			"Writes target your own project scope by default; 'global' is the only other writable scope.",
+			"`scope` is optional and defaults to your own scope. Writes are allowed only to your own scope or 'global'; other scopes are rejected.",
 			"Use #tags (e.g. #decision, #preference, #lesson, #bug) and [[links]] (e.g. [[auth-strategy]]) in content to improve searchability.",
 		].join("\n"),
 		parameters: Type.Object({
@@ -2613,7 +2622,7 @@ export default function (pi: ExtensionAPI) {
 			"- 'undo': Uncheck a done item back to open. Match by substring.",
 			"- 'clear_done': Remove all checked items from the list.",
 			"- 'list': Show all items.",
-			"The scratchpad belongs to your own project scope by default; 'global' is the only other writable scope.",
+			"`scope` is optional and defaults to your own scope. Writes are allowed only to your own scope or 'global'; other scopes are rejected.",
 		].join("\n"),
 		parameters: Type.Object({
 			action: StringEnum(["add", "done", "undo", "clear_done", "list"] as const, {
@@ -2800,7 +2809,8 @@ export default function (pi: ExtensionAPI) {
 			"- 'scratchpad': Read SCRATCHPAD.md",
 			"- 'daily': Read a specific day's log (default: today). Pass date as YYYY-MM-DD.",
 			"- 'list': List all daily log files.",
-			"Reads the active scope set by default; pass 'scopes' to widen to another existing scope.",
+			"`scopes` is optional and defaults to the active scope set; it may name any existing scope (widening).",
+			"Results are grouped under `## Scope: <id>` headings in set order; scopes with no content are omitted.",
 		].join("\n"),
 		parameters: Type.Object({
 			target: StringEnum(["long_term", "scratchpad", "daily", "list"] as const, {
@@ -2845,13 +2855,15 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const sections = scopes.map((scope) => ({
-				scope: scope.id,
-				body: readMemoryTarget(scope.dir, target, date).text,
-			}));
+			// A scope with no content contributes no block at all; only when every
+			// scope is empty do we fall back to printing the per-scope messages.
+			const results = scopes.map((scope) => ({ scope, result: readMemoryTarget(scope.dir, target, date) }));
+			const withContent = results.filter(({ result }) => !result.empty);
+			const included = withContent.length > 0 ? withContent : results;
+			const sections = included.map(({ scope, result }) => ({ scope: scope.id, body: result.text }));
 			return {
 				content: [{ type: "text", text: formatScopedSections(sections) }],
-				details: { scopes: scopes.map((scope) => scope.id) },
+				details: { scopes: sections.map((section) => section.scope) },
 			};
 		},
 	});
@@ -2867,7 +2879,7 @@ export default function (pi: ExtensionAPI) {
 			"whose visible recovery ID can be passed to memory_restore if the deletion was wrong.",
 			"Use this when the user corrects a stored fact or a memory is no longer true —",
 			"stale entries keep resurfacing in retrieval and cause confidently wrong answers.",
-			"Deletes from your own project scope by default; 'global' is the only other writable scope.",
+			"`scope` is optional and defaults to your own scope. Deletes are allowed only from your own scope or 'global'; other scopes are rejected.",
 		].join("\n"),
 		parameters: Type.Object({
 			match: Type.String({
@@ -2981,6 +2993,7 @@ export default function (pi: ExtensionAPI) {
 		description: [
 			"Restore entries removed by memory_forget using the recovery ID returned by that tool.",
 			"Restoration is idempotent and appends only missing entries, so later memory writes survive.",
+			"Takes no scope parameter: the recovery ID identifies the record, and the record knows its scope.",
 		].join("\n"),
 		parameters: Type.Object({
 			recoveryId: Type.String({ description: "Recovery ID returned by memory_forget" }),
@@ -3051,7 +3064,9 @@ export default function (pi: ExtensionAPI) {
 			"- 'deep' (~10s): Hybrid search with reranking. Use when other modes don't find what you need.\n" +
 			"If semantic/deep warns about missing embeddings, embedding starts automatically in the background — retry shortly.\n" +
 			"If the first search doesn't find what you need, try rephrasing or switching modes. " +
-			"Keyword mode is best for specific terms; semantic mode finds related concepts even with different wording.",
+			"Keyword mode is best for specific terms; semantic mode finds related concepts even with different wording.\n" +
+			"`scopes` is optional and defaults to the active scope set; it may name any existing scope (widening). " +
+			"Results are tagged with their scope id.",
 		parameters: Type.Object({
 			query: Type.String({ description: "Search query" }),
 			mode: Type.Optional(
@@ -3197,9 +3212,10 @@ export default function (pi: ExtensionAPI) {
 		name: "memory_status",
 		label: "Memory Status",
 		description:
-			"Report the health of the memory system: where files live, what's stored, " +
-			"whether qmd search is available, whether the pi-memory collection exists, " +
-			"whether embeddings are ready, and the active configuration. " +
+			"Report the health of the memory system: the active scope set, each scope's directory " +
+			"and qmd collection state, orphan collections, which files are stored, whether qmd search " +
+			"is available, whether embeddings are ready, and the active configuration. " +
+			"Takes no scope parameter: it always reports every active scope. " +
 			"Use this when search behaves unexpectedly or to confirm setup.",
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
@@ -3218,19 +3234,47 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const mark = (ok: boolean) => (ok ? "✓" : "✗");
+			const ctx = scopeContext();
+			// Per-scope layout needs no qmd: directories and collection names are
+			// computed from the naming rule; collection state is only checked when
+			// qmd is available (never shell out from here).
+			const scopeRows = ctx.activeScopes.map((id) => {
+				const info = scopeInfoForId(id, ctx);
+				const dir = info?.dir ?? scopeDirPath(memoryRoot, id) ?? "?";
+				const collection = collectionNameForScope(id, info?.dir);
+				const diagnostic = diagnostics?.scopes.find((scope) => scope.scope === (info?.id ?? id));
+				const dirExists = diagnostic ? diagnostic.dirExists : dir !== "?" && fs.existsSync(dir);
+				const collectionState: "exists" | "missing" | "unchecked" =
+					!qmdOk || !dirExists || !diagnostic ? "unchecked" : diagnostic.exists ? "exists" : "missing";
+				return {
+					id: displayScopeId(info?.id ?? id),
+					own: id === ctx.ownScope,
+					dir,
+					dirExists,
+					collection,
+					collectionState,
+				};
+			});
+			const scopeMark = (state: "exists" | "missing" | "unchecked") =>
+				state === "exists" ? "✓" : state === "missing" ? "✗" : "—";
 			const lines: string[] = [
 				"# Memory status",
 				"",
 				`- Scope: ${ownScopeId} (own)`,
-				`- Active scopes: ${activeScopeSet.join(", ")}`,
+				`- Active scopes: ${activeScopeSet.map((id) => (id === ownScopeId ? `${displayScopeId(id)} (own)` : displayScopeId(id))).join(", ")}`,
 				`- Memory dir: ${inv.dir}`,
 				`- MEMORY.md: ${inv.longTermChars} chars`,
 				`- Scratchpad: ${inv.scratchpadOpen} open / ${inv.scratchpadTotal} total`,
 				`- Daily logs: ${inv.dailyCount}${inv.latestDaily ? ` (latest ${inv.latestDaily})` : ""}`,
 				"",
-				"## Search (qmd)",
-				`- qmd available: ${mark(qmdOk)}`,
+				"## Scopes",
 			];
+			for (const row of scopeRows) {
+				lines.push(
+					`- ${row.id}${row.own ? " (own)" : ""}: ${row.dir} — exists ${mark(row.dirExists)}, collection \`${row.collection ?? "—"}\`: ${scopeMark(row.collectionState)}`,
+				);
+			}
+			lines.push("", "## Search (qmd)", `- qmd available: ${mark(qmdOk)}`);
 
 			if (qmdOk) {
 				lines.push(`- Collection \`${GLOBAL_COLLECTION_NAME}\`: ${mark(collectionOk)}`);
@@ -3309,6 +3353,7 @@ export default function (pi: ExtensionAPI) {
 					qmd: qmdOk,
 					collection: collectionOk,
 					embeddings,
+					scopes: scopeRows,
 					collections: diagnostics?.scopes ?? [],
 					orphanCollections: diagnostics?.orphans ?? [],
 					orphanChunks: diagnostics?.orphanChunks ?? null,
