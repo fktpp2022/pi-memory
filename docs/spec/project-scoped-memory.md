@@ -43,7 +43,7 @@ global | project:<slug> | project:<slug>#<hash>
 
 **Scope identity is path-bound.** Moving or renaming a repo changes its scope id and its collection name. Accepted: the absolute path is predictable; a remote URL is not an identity (absent, forked, mirrored). The escape hatch is the `project` key in `.pi/memory.json` (chapter 3), which sets the slug explicitly.
 
-**Scope resolution happens in `session_start` from `ctx.cwd`** — never at import and never from `process.cwd()` (which is the launch dir, not the session dir). `ctx.cwd` is a snapshot refreshed only by a runtime replacement (`/resume` of a session recorded elsewhere), which re-runs the factory and re-evaluates module state anyway. Re-resolve on every `session_start`; rebuild project-scoped state (qmd collections, injected context) only when the resolved cwd or scope set actually changes; release session-bound resources in `session_shutdown`. Evidence: [docs/research/pi-cwd-and-session-lifecycle.md](../research/pi-cwd-and-session-lifecycle.md) (fork only) and appendix A.
+**Scope resolution happens in `session_start` from `ctx.cwd`** — never at import and never from `process.cwd()` (which is the launch dir, not the session dir). `ctx.cwd` is a snapshot refreshed only by a runtime replacement (`/resume` of a session recorded elsewhere), which re-runs the factory and re-evaluates module state anyway. Re-resolve on every `session_start`; rebuild project-scoped state (qmd collections, injected context) only when the resolved cwd or scope set actually changes; release session-bound resources in `session_shutdown`. Evidence: [pi-cwd-and-session-lifecycle.md](../research/pi-cwd-and-session-lifecycle.md) (shipped with this spec) and appendix A.
 
 ---
 
@@ -279,7 +279,7 @@ qmd context add "qmd://<name>/daily" "Daily append-only work logs organized by d
 qmd context add "qmd://<name>/"     "Curated long-term memory: decisions, preferences, facts, lessons"
 ```
 
-**Removing a collection deletes its contexts** (verified), so the contexts are re-added in the same operation. Every scope collection gets the same two contexts, added at creation — contexts are per-collection, so project collections need their own. Note the path form: there is **no `-c` flag**; the collection is part of the `qmd://` path (this is the fix for an existing call in `index.ts` today that passes `-c pi-memory` and has never worked — appendix B).
+**Removing a collection deletes its contexts** (verified), so the contexts are re-added in the same operation. Every scope collection gets the same two contexts, added at creation — contexts are per-collection, so project collections need their own. Note the path form: there is **no `-c` flag**; the collection is part of the `qmd://` path (this is the fix for an existing call in `index.ts` today — `qmd context add /daily "…" -c pi-memory` — that passes `-c` and has never worked, appendix B).
 
 **The migration owns the global re-point**, at chapter 7's step. Not now: the legacy `pi-memory` collection points at `<memory-root>`, whose `**/*.md` covers `global/` and `projects/*` alike; re-pointing it before the files move would point the index at an empty directory and make the user's memory vanish from search. A collection whose path differs for any other reason (the user moved a scope directory) is re-pointed the same way, at the next session start.
 
@@ -475,6 +475,12 @@ Decisions made during the map that **supersede** an earlier statement:
 2. **`PI_MEMORY_DIR` semantics (#9 → #10).** It is the memory **root** (holding `global/` and `projects/`), not a scope directory. Pointing it at a scope-shaped directory is a warned misconfiguration, not a supported way to select a scope.
 3. **Seven tools, not six (#3).** `scratchpad` is a tool and is scoped with the others.
 4. **The upstream route (#11).** Community best practice overrode the recommendation: an **issue precedes the PR**.
+
+**Defect found (pre-existing, fixed by this spec):** `index.ts` calls
+`qmd context add /daily "…" -c pi-memory` when creating a collection. `-c` is not a
+flag on `qmd context add` and the collection must be part of the path, so that call has
+never succeeded — it throws and is swallowed by the surrounding `catch`. §6.4 gives the
+working form. No test covers it today; the case matrix's context case (§9.4) would have caught it.
 
 ## C. Deliberate omissions
 
