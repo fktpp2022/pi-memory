@@ -2379,8 +2379,49 @@ export interface MemoryPanelRow {
 	staged: boolean;
 }
 
+/** A non-scope row: an action the panel runs instead of a scope it toggles. */
+export interface MemoryPanelActionRow {
+	/** Row id passed to activateMemoryPanelRow. */
+	id: string;
+	label: string;
+	description?: string;
+}
+
+/** Migrate row id; scope ids are `global` or `project:...`, so this cannot collide. */
+export const MEMORY_PANEL_MIGRATE_ROW_ID = "action:migrate";
+
+/**
+ * Action rows appended after the scope rows. Migrate stays last so the
+ * parallel Status row (#26) can prepend without reordering this one.
+ */
+export function buildMemoryPanelActionRows(): MemoryPanelActionRow[] {
+	return [
+		{
+			id: MEMORY_PANEL_MIGRATE_ROW_ID,
+			label: "Migrate",
+			description: "plan and apply the scope layout migration",
+		},
+	];
+}
+
+/** What the panel knows about migration before the user decides. */
+export type MemoryPanelMigration = { kind: "refused"; message: string } | { kind: "planned"; plan: MigratePlan };
+
+/** Enter on Migrate: notify (refused / nothing) or confirm and apply the plan. */
+export interface MemoryPanelMigrateAction {
+	kind: "migrate";
+	/** Verbatim refusal while the legacy memory-scope.ts is installed; null otherwise. */
+	refusal: string | null;
+	/** Plan to apply; null when refused. */
+	plan: MigratePlan | null;
+	/** No work left: notify "nothing to migrate" instead of confirming. */
+	nothingToMigrate: boolean;
+	/** Confirmation body listing the file moves and collection operations. */
+	summary: string;
+}
+
 /** What activating a row asks the command layer to do. */
-export type MemoryPanelAction = { kind: "apply"; extraScopes: string[] } | { kind: "none" };
+export type MemoryPanelAction = { kind: "apply"; extraScopes: string[] } | MemoryPanelMigrateAction | { kind: "none" };
 
 /** Matcher for the own scope: exact when hash-qualified, display form otherwise. */
 function panelOwnScopeMatcher(ownScope: string): (id: string) => boolean {
@@ -2481,10 +2522,32 @@ export function toggleMemoryPanelRow(state: MemoryPanelState, scopeId: string): 
 /**
  * Enter on a scope row: apply the staged set. Extras come out in row order,
  * which keeps the resulting set order stable regardless of toggle order.
+ * Enter on the Migrate row: decide notify vs confirm from a fresh preview.
  */
-export function activateMemoryPanelRow(state: MemoryPanelState, scopeId: string): MemoryPanelAction {
+function migratePanelAction(migration: MemoryPanelMigration): MemoryPanelMigrateAction {
+	if (migration.kind === "refused") {
+		return { kind: "migrate", refusal: migration.message, plan: null, nothingToMigrate: false, summary: "" };
+	}
+	if (migration.plan.alreadyMigrated) {
+		return { kind: "migrate", refusal: null, plan: migration.plan, nothingToMigrate: true, summary: "" };
+	}
+	return {
+		kind: "migrate",
+		refusal: null,
+		plan: migration.plan,
+		nothingToMigrate: false,
+		summary: formatMigratePlan(migration.plan),
+	};
+}
+
+export function activateMemoryPanelRow(
+	state: MemoryPanelState,
+	rowId: string,
+	migration?: MemoryPanelMigration,
+): MemoryPanelAction {
+	if (rowId === MEMORY_PANEL_MIGRATE_ROW_ID) return migration ? migratePanelAction(migration) : { kind: "none" };
 	const rows = buildMemoryPanelRows(state);
-	if (!rows.some((row) => row.scopeId === scopeId)) return { kind: "none" };
+	if (!rows.some((row) => row.scopeId === rowId)) return { kind: "none" };
 	const extraScopes = rows.filter((row) => !row.isOwn && row.staged).map((row) => row.scopeId);
 	return { kind: "apply", extraScopes };
 }
@@ -2521,6 +2584,19 @@ function currentPanelState(): MemoryPanelState {
 	return createMemoryPanelState(panelOwnScopeId(), listKnownScopes(memoryRoot), activeScopeSet);
 }
 
+/** Fresh Migrate preview: the installed-extension refusal first, then the existing planner. */
+async function buildMemoryPanelMigration(): Promise<MemoryPanelMigration> {
+	const refusal = memoryScopeRefusal();
+	if (refusal) return { kind: "refused", message: refusal };
+	const qmdAvailable = await detectQmd();
+	const input: MigratePlanInput = {
+		memoryRoot,
+		qmdAvailable,
+		collections: qmdAvailable ? await readMigrationCollections(memoryRoot) : {},
+	};
+	return { kind: "planned", plan: planMemoryMigration(input) };
+}
+
 interface MemoryPanelActions {
 	/** Apply the staged extras; returns an error message when the apply failed. */
 	apply: (extraScopes: string[]) => string | null;
@@ -2528,6 +2604,12 @@ interface MemoryPanelActions {
 	freshState: () => MemoryPanelState;
 	/** One-line header rebuilt from the applied set on every render. */
 	header: () => string;
+	/** Fresh migration preview from the existing planner, or the installed-extension refusal. */
+	migratePreview: () => Promise<MemoryPanelMigration>;
+	/** Confirmation gate before a migration changes anything. */
+	confirmMigrate: (summary: string) => Promise<boolean>;
+	/** Apply through the existing command path; returns the failure text or null. */
+	applyMigrate: () => Promise<string | null>;
 	notify: (message: string, type?: "info" | "warning" | "error") => void;
 	close: () => void;
 }
@@ -2563,15 +2645,24 @@ class MemoryPanelView implements Component {
 	}
 
 	private buildList(): SelectList {
-		// Action rows (Status #26, Migrate #27) append here as further items.
-		const items = buildMemoryPanelRows(this.state).map((row) => ({
-			value: row.scopeId,
-			label: `${row.staged ? "[x]" : "[ ]"} ${row.label}${row.isOwn ? " (own)" : ""}`,
-			description: row.locked ? "locked: this session's scope" : undefined,
-		}));
+		const items = [
+			...buildMemoryPanelRows(this.state).map((row) => ({
+				value: row.scopeId,
+				label: `${row.staged ? "[x]" : "[ ]"} ${row.label}${row.isOwn ? " (own)" : ""}`,
+				description: row.locked ? "locked: this session's scope" : undefined,
+			})),
+			// Action rows (Status #26, Migrate #27) come after every scope row.
+			...buildMemoryPanelActionRows().map((row) => ({
+				value: row.id,
+				label: row.label,
+				description: row.description,
+			})),
+		];
 		const list = new SelectList(items, 10, this.selectListTheme());
 		list.setSelectedIndex(this.selectedIndex);
-		list.onSelect = (item) => this.activate(item.value);
+		list.onSelect = (item) => {
+			void this.activate(item.value);
+		};
 		list.onCancel = () => this.actions.close();
 		list.onSelectionChange = (item) => {
 			const index = items.findIndex((candidate) => candidate.value === item.value);
@@ -2591,14 +2682,46 @@ class MemoryPanelView implements Component {
 		this.rebuild();
 	}
 
-	private activate(scopeId: string) {
-		const action = activateMemoryPanelRow(this.state, scopeId);
+	private async activate(rowId: string) {
+		if (rowId === MEMORY_PANEL_MIGRATE_ROW_ID) {
+			const action = activateMemoryPanelRow(this.state, rowId, await this.actions.migratePreview());
+			if (action.kind === "migrate") await this.runMigrate(action);
+			return;
+		}
+		const action = activateMemoryPanelRow(this.state, rowId);
 		if (action.kind !== "apply") return;
 		const error = this.actions.apply(action.extraScopes);
 		if (error) {
 			this.actions.notify(error, "error");
 			return;
 		}
+		this.state = this.actions.freshState();
+		this.rebuild();
+	}
+
+	/** Refusal and empty plans only notify; a real plan is confirmed before it applies. */
+	private async runMigrate(action: MemoryPanelMigrateAction) {
+		if (action.refusal) {
+			this.actions.notify(action.refusal, "warning");
+			return;
+		}
+		if (action.nothingToMigrate) {
+			this.actions.notify("nothing to migrate");
+			return;
+		}
+		if (!action.plan) return;
+		if (!(await this.actions.confirmMigrate(action.summary))) return;
+		let error: string | null;
+		try {
+			error = await this.actions.applyMigrate();
+		} catch (err) {
+			error = err instanceof Error ? err.message : String(err);
+		}
+		if (error) {
+			this.actions.notify(error, "error");
+			return;
+		}
+		this.actions.notify("migration applied");
 		this.state = this.actions.freshState();
 		this.rebuild();
 	}
@@ -2636,6 +2759,13 @@ async function openMemoryPanel(ctx: ExtensionCommandContext): Promise<void> {
 			},
 			freshState: currentPanelState,
 			header: () => buildMemoryPanelHeader(activeScopeSet, memoryRoot),
+			migratePreview: buildMemoryPanelMigration,
+			confirmMigrate: (summary) => ctx.ui.confirm("Migrate memory layout?", summary),
+			applyMigrate: async () => {
+				// Keep one apply path: the command re-plans and executes; undo stays CLI-only.
+				const result = await runMemoryMigrate(["--apply"]);
+				return result.code === 0 ? null : result.text;
+			},
 			notify: (message, type) => ctx.ui.notify(message, type),
 			close: () => done(undefined),
 		});
@@ -2729,6 +2859,17 @@ function defaultExtensionsDir(): string {
 
 function resolveExtensionsDir(): string {
 	return extensionsDirOverride ?? defaultExtensionsDir();
+}
+
+/** Verbatim refusal shared by `/memory migrate` and the panel's Migrate row. */
+function memoryScopeRefusal(): string | null {
+	const memoryScopePath = path.join(resolveExtensionsDir(), "memory-scope.ts");
+	if (!fs.existsSync(memoryScopePath)) return null;
+	return [
+		`refusing to migrate: ${memoryScopePath} still exists.`,
+		"It re-points the pi-memory collection at the current project directory at module load, which would immediately undo the migration.",
+		"Rename that file, then run /reload.",
+	].join("\n");
 }
 
 export type MigrateActionStatus = "pending" | "done" | "skipped" | "failed";
@@ -3323,18 +3464,8 @@ export async function runMemoryMigrate(args: string[]): Promise<{ text: string; 
 	if (parsed.error) return { text: `${parsed.error}\n${MIGRATE_USAGE}`, code: 2 };
 
 	const root = memoryRoot;
-	const extensionsDir = resolveExtensionsDir();
-	const memoryScopePath = path.join(extensionsDir, "memory-scope.ts");
-	if (fs.existsSync(memoryScopePath)) {
-		return {
-			text: [
-				`refusing to migrate: ${memoryScopePath} still exists.`,
-				"It re-points the pi-memory collection at the current project directory at module load, which would immediately undo the migration.",
-				"Rename that file, then run /reload.",
-			].join("\n"),
-			code: 2,
-		};
-	}
+	const refusal = memoryScopeRefusal();
+	if (refusal) return { text: refusal, code: 2 };
 
 	let manifest: MigrationManifest | null = null;
 	if (parsed.undo) {

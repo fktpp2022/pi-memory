@@ -32,6 +32,7 @@ import {
 	activateMemoryPanelRow,
 	applyScopeSetChange,
 	buildMemoryContext,
+	buildMemoryPanelActionRows,
 	buildMemoryPanelHeader,
 	buildMemoryPanelRows,
 	buildQmdEnv,
@@ -56,6 +57,7 @@ import {
 	isExitSummaryEnabled,
 	listKnownScopes,
 	loadProjectConfig,
+	MEMORY_PANEL_MIGRATE_ROW_ID,
 	memoryDirWarning,
 	movePathSync,
 	nowTimestamp,
@@ -5350,5 +5352,205 @@ describe("/memory panel list state", () => {
 		const header = buildMemoryPanelHeader([own, "project:other#aaaa1111"], "/tmp/pi-memory-root");
 
 		expect(header.split("\n")).toEqual(["Scopes: project:app (own), project:other", "Root: /tmp/pi-memory-root"]);
+	});
+});
+
+// ==========================================================================
+// 20. `/memory` panel Migrate row (ticket #27)
+// ==========================================================================
+
+describe("/memory panel migrate row", () => {
+	let root: string;
+	let extDir: string;
+
+	const panelState = () => createMemoryPanelState("global", ["global"], ["global"]);
+
+	const makeLegacyRoot = (): string => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-panel-migrate-"));
+		fs.mkdirSync(path.join(dir, "daily"), { recursive: true });
+		fs.writeFileSync(path.join(dir, "MEMORY.md"), "global memory\n", "utf-8");
+		fs.writeFileSync(path.join(dir, "SCRATCHPAD.md"), "todos\n", "utf-8");
+		fs.writeFileSync(path.join(dir, "daily", "2026-01-01.md"), "log\n", "utf-8");
+		return dir;
+	};
+
+	beforeEach(() => {
+		_resetBaseDir();
+		root = makeLegacyRoot();
+		extDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-panel-ext-"));
+		_setMemoryRoot(root);
+		_setScopeSetForTest("global");
+		_setExtensionsDirForTest(extDir);
+		_clearQmdStatusCaches();
+		_setQmdAvailable(false);
+	});
+
+	afterEach(() => {
+		_setExtensionsDirForTest(null);
+		_resetBaseDir();
+		_resetExecFileForTest();
+		_setQmdAvailable(false);
+		_clearQmdStatusCaches();
+		fs.rmSync(root, { recursive: true, force: true });
+		fs.rmSync(extDir, { recursive: true, force: true });
+	});
+
+	test("appends the Migrate action row after the scope rows", () => {
+		const actionRows = buildMemoryPanelActionRows();
+		const scopeIds = buildMemoryPanelRows(panelState()).map((row) => row.scopeId);
+
+		expect(actionRows.at(-1)).toMatchObject({ id: MEMORY_PANEL_MIGRATE_ROW_ID, label: "Migrate" });
+		expect(scopeIds).not.toContain(MEMORY_PANEL_MIGRATE_ROW_ID);
+	});
+
+	test("an already-migrated plan asks for no confirmation", () => {
+		fs.rmSync(path.join(root, "MEMORY.md"));
+		fs.rmSync(path.join(root, "SCRATCHPAD.md"));
+		fs.rmSync(path.join(root, "daily"), { recursive: true });
+		fs.mkdirSync(path.join(root, "global"), { recursive: true });
+		const plan = planMemoryMigration({ memoryRoot: root, qmdAvailable: false });
+		expect(plan.alreadyMigrated).toBe(true);
+
+		const action = activateMemoryPanelRow(panelState(), MEMORY_PANEL_MIGRATE_ROW_ID, { kind: "planned", plan });
+
+		expect(action).toMatchObject({
+			kind: "migrate",
+			refusal: null,
+			plan,
+			nothingToMigrate: true,
+			summary: "",
+		});
+	});
+
+	test("a non-empty plan carries a confirmation summary of moves and collection operations", () => {
+		const plan = planMemoryMigration({
+			memoryRoot: root,
+			qmdAvailable: true,
+			collections: { "pi-memory": root },
+		});
+
+		const action = activateMemoryPanelRow(panelState(), MEMORY_PANEL_MIGRATE_ROW_ID, { kind: "planned", plan });
+
+		expect(action.kind).toBe("migrate");
+		if (action.kind !== "migrate") throw new Error("expected a migrate action");
+		expect(action.nothingToMigrate).toBe(false);
+		expect(action.refusal).toBeNull();
+		expect(action.plan).toBe(plan);
+		expect(action.summary).toContain("move    MEMORY.md");
+		expect(action.summary).toContain("-> global/MEMORY.md");
+		expect(action.summary).toContain("remove  collection pi-memory");
+		expect(action.summary).toContain("add     collection pi-memory");
+	});
+
+	test("a refusal is carried verbatim and never asks to apply", () => {
+		const message =
+			"refusing to migrate: /tmp/ext/memory-scope.ts still exists.\nRename that file, then run /reload.";
+
+		const action = activateMemoryPanelRow(panelState(), MEMORY_PANEL_MIGRATE_ROW_ID, {
+			kind: "refused",
+			message,
+		});
+
+		expect(action).toEqual({
+			kind: "migrate",
+			refusal: message,
+			plan: null,
+			nothingToMigrate: false,
+			summary: "",
+		});
+	});
+
+	test("activating Migrate without a preview does nothing", () => {
+		expect(activateMemoryPanelRow(panelState(), MEMORY_PANEL_MIGRATE_ROW_ID)).toEqual({ kind: "none" });
+	});
+
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+
+	/** Open the panel and hand back its live component plus the mocked dialogs. */
+	const openPanel = async (confirmAnswer: boolean) => {
+		let component: any;
+		const done = mock(() => {});
+		const confirm = mock(async () => confirmAnswer);
+		const notify = mock(() => {});
+		const mockPi = createMockPi();
+		registerExtension(mockPi.pi as any);
+		await mockPi.commands.memory.options.handler("", {
+			cwd: root,
+			mode: "tui",
+			hasUI: true,
+			sessionManager: { getSessionId: () => "panelmigrate0001" },
+			ui: {
+				notify,
+				confirm,
+				custom: mock((factory: any) => {
+					component = factory({ requestRender: () => {} }, theme, { matches: () => false }, done);
+					return Promise.resolve(undefined);
+				}),
+			},
+		});
+		return { component, done, confirm, notify };
+	};
+
+	/** One down moves from the locked own scope row to the Migrate row. */
+	const pressMigrate = async (component: any) => {
+		component.handleInput("\u001b[B");
+		component.handleInput("\r");
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	};
+
+	test("enter on an empty plan notifies and leaves the panel open", async () => {
+		fs.rmSync(path.join(root, "MEMORY.md"));
+		fs.rmSync(path.join(root, "SCRATCHPAD.md"));
+		fs.rmSync(path.join(root, "daily"), { recursive: true });
+		fs.mkdirSync(path.join(root, "global"), { recursive: true });
+		const { component, done, confirm, notify } = await openPanel(true);
+
+		await pressMigrate(component);
+
+		expect(notify.mock.calls[0]?.[0]).toBe("nothing to migrate");
+		expect(confirm).not.toHaveBeenCalled();
+		expect(done).not.toHaveBeenCalled();
+	});
+
+	test("an installed memory-scope.ts is refused with the command's exact text", async () => {
+		fs.writeFileSync(path.join(extDir, "memory-scope.ts"), "// legacy extension\n", "utf-8");
+		const refusal = (await runMemoryMigrate([])).text;
+		const { component, done, confirm, notify } = await openPanel(true);
+
+		await pressMigrate(component);
+
+		expect(notify.mock.calls[0]?.[0]).toBe(refusal);
+		expect(confirm).not.toHaveBeenCalled();
+		expect(done).not.toHaveBeenCalled();
+		expect(fs.existsSync(path.join(root, "MEMORY.md"))).toBe(true);
+		expect(fs.existsSync(path.join(root, "global"))).toBe(false);
+	});
+
+	test("confirming applies the migration and keeps the panel open", async () => {
+		const { component, done, confirm, notify } = await openPanel(true);
+
+		await pressMigrate(component);
+
+		expect(confirm).toHaveBeenCalledTimes(1);
+		const [title, summary] = confirm.mock.calls[0] as unknown as [string, string];
+		expect(title).toBeTruthy();
+		expect(summary).toContain("move    MEMORY.md");
+		expect(summary).toContain("-> global/MEMORY.md");
+		expect(fs.readFileSync(path.join(root, "global", "MEMORY.md"), "utf-8")).toBe("global memory\n");
+		expect(fs.existsSync(path.join(root, "MEMORY.md"))).toBe(false);
+		expect(notify.mock.calls[0]?.[0]).toBe("migration applied");
+		expect(done).not.toHaveBeenCalled();
+	});
+
+	test("declining leaves memory untouched and keeps the panel open", async () => {
+		const { component, done, confirm, notify } = await openPanel(false);
+
+		await pressMigrate(component);
+
+		expect(confirm).toHaveBeenCalledTimes(1);
+		expect(fs.readFileSync(path.join(root, "MEMORY.md"), "utf-8")).toBe("global memory\n");
+		expect(fs.existsSync(path.join(root, "global"))).toBe(false);
+		expect(notify).not.toHaveBeenCalled();
+		expect(done).not.toHaveBeenCalled();
 	});
 });
