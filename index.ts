@@ -2428,23 +2428,32 @@ export function readMigrationManifest(root: string): MigrationManifest | null {
 }
 
 function writeMigrationManifest(root: string, plan: MigratePlan) {
-	const moves = plan.actions
-		.filter(
-			(action): action is MigrateMoveAction =>
-				action.kind === "move" && !action.conflict && action.status === "done",
-		)
-		.map((action) => ({ from: action.from, to: action.to }));
-	const collections = plan.actions
-		.filter(
-			(action): action is MigrateAddCollectionAction => action.kind === "addCollection" && action.status === "done",
-		)
-		.map((action) => ({ name: action.name, action: action.manifestAction, path: action.path }));
-	const contexts = plan.actions
-		.filter((action): action is MigrateAddContextAction => action.kind === "addContext" && action.status === "done")
-		.map((action) => ({
-			collection: action.collection,
-			path: action.subPath === "" ? "/" : `/${action.subPath}`,
-		}));
+	// Merge with an earlier partial run: a re-run that only completes the qmd
+	// steps must not drop the moves the first run recorded, or --undo could
+	// never move the files back.
+	const previous = readMigrationManifest(root);
+	const moves = [...(previous?.moves ?? [])];
+	for (const action of plan.actions) {
+		if (action.kind !== "move" || action.conflict || action.status !== "done") continue;
+		if (moves.some((move) => move.from === action.from)) continue;
+		moves.push({ from: action.from, to: action.to });
+	}
+	const collections = [...(previous?.collections ?? [])];
+	for (const action of plan.actions) {
+		if (action.kind !== "addCollection" || action.status !== "done") continue;
+		const entry = { name: action.name, action: action.manifestAction, path: action.path };
+		const index = collections.findIndex((collection) => collection.name === action.name);
+		if (index === -1) collections.push(entry);
+		else collections[index] = entry;
+	}
+	const contexts = [...(previous?.contexts ?? [])];
+	for (const action of plan.actions) {
+		if (action.kind !== "addContext" || action.status !== "done") continue;
+		const contextPath = action.subPath === "" ? "/" : `/${action.subPath}`;
+		if (contexts.some((context) => context.collection === action.collection && context.path === contextPath))
+			continue;
+		contexts.push({ collection: action.collection, path: contextPath });
+	}
 	const manifest: MigrationManifest = {
 		version: 1,
 		timestamp: new Date().toISOString(),
@@ -2750,7 +2759,14 @@ export async function runMemoryMigrate(args: string[]): Promise<{ text: string; 
 
 	const outcome = await executeMigratePlan(plan, root);
 	if (parsed.undo) {
-		if (outcome.conflicts === 0 && outcome.failed === 0) {
+		// Keep the manifest when qmd could not restore the collections: a later
+		// `--undo --apply` retries just the qmd steps.
+		const qmdStepsSkipped = plan.actions.some(
+			(action) =>
+				(action.kind === "removeCollection" || action.kind === "addCollection" || action.kind === "addContext") &&
+				action.status === "skipped",
+		);
+		if (outcome.conflicts === 0 && outcome.failed === 0 && !qmdStepsSkipped) {
 			try {
 				fs.rmSync(path.join(root, ".migration-manifest.json"), { force: true });
 			} catch {

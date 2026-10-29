@@ -4018,6 +4018,46 @@ describe("memory migration", () => {
 		expect(result.text.toLowerCase()).toContain("manifest");
 	});
 
+	test("undo without qmd keeps the manifest for a later qmd retry", async () => {
+		await runMemoryMigrate(["--apply"]);
+		_setQmdAvailable(false);
+		_clearQmdStatusCaches();
+		_setQmdAvailable(false);
+
+		const result = await runMemoryMigrate(["--undo", "--apply"]);
+
+		expect(result.code).toBe(0);
+		expect(fs.existsSync(path.join(root, "MEMORY.md"))).toBe(true);
+		expect(fs.existsSync(path.join(root, ".migration-manifest.json"))).toBe(true);
+	});
+
+	test("a qmd-less apply completed later with qmd keeps the earlier moves undoable", async () => {
+		_setQmdAvailable(false);
+		_clearQmdStatusCaches();
+		_setQmdAvailable(false);
+		await runMemoryMigrate(["--apply"]);
+
+		_setQmdAvailable(true);
+		_clearQmdStatusCaches();
+		_setQmdAvailable(true);
+		const completed = await runMemoryMigrate(["--apply"]);
+		expect(completed.code).toBe(0);
+
+		const manifest = JSON.parse(fs.readFileSync(path.join(root, ".migration-manifest.json"), "utf-8"));
+		expect(manifest.moves).toEqual(
+			expect.arrayContaining([
+				{ from: "MEMORY.md", to: "global/MEMORY.md" },
+				{ from: "daily", to: "global/daily" },
+			]),
+		);
+		expect(manifest.collections.some((collection: any) => collection.name === "pi-memory")).toBe(true);
+
+		const undo = await runMemoryMigrate(["--undo", "--apply"]);
+		expect(undo.code).toBe(0);
+		expect(fs.readFileSync(path.join(root, "MEMORY.md"), "utf-8")).toBe("global memory\n");
+		expect(fs.existsSync(path.join(root, ".migration-manifest.json"))).toBe(false);
+	});
+
 	test("unknown flags print usage and exit 2", async () => {
 		const result = await runMemoryMigrate(["--force"]);
 		expect(result.code).toBe(2);
