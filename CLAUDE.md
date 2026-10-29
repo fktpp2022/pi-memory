@@ -37,6 +37,20 @@ Key design patterns:
 
 Uses `@earendil-works/pi-coding-agent` for extension APIs and `@earendil-works/pi-ai` for model, schema, and compatibility APIs. These are peer deps — provided by the pi runtime.
 
+## Agent skills
+
+### Issue tracker
+
+GitHub issues in `fktpp2022/pi-memory` (pass `--repo fktpp2022/pi-memory` to `gh`). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default five-role vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: root `GLOSSARY.md` + `docs/adr/`. See `docs/agents/domain.md`.
+
 ## Testing
 
 Tests are e2e only — they invoke `pi` as a subprocess with the extension loaded, send LLM prompts, and verify tool calls happened and files were written. Tests back up and restore `~/.pi/agent/memory/` files automatically. Each test runs a fresh `pi --no-session` invocation.
