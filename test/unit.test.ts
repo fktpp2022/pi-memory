@@ -7,6 +7,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -49,6 +50,7 @@ import {
 	parseScopesEnv,
 	parseScratchpad,
 	probeEmbeddings,
+	projectRootFor,
 	projectScopeId,
 	qmdCollectionInstructions,
 	qmdInstallInstructions,
@@ -2947,7 +2949,17 @@ describe("tool scope resolution", () => {
 	test("writes to another scope fail with the documented error", () => {
 		const message = "scope 'project:other' is not writable; writes target your own scope or global";
 		expect(() => resolveWritableScope("project:other", ctx)).toThrow(message);
-		expect(() => resolveWritableScope("project:ghost", ctx)).toThrow(message.replace("other", "ghost"));
+	});
+
+	test("writes to an unknown scope report the unknown id, not 'not writable'", () => {
+		let message = "";
+		try {
+			resolveWritableScope("project:ghost", ctx);
+		} catch (err) {
+			message = err instanceof Error ? err.message : String(err);
+		}
+		expect(message).toContain('unknown scope id "project:ghost"');
+		expect(message).toContain("known scopes: global, project:chezmoi#d24458d5, project:other#aaaa1111");
 	});
 
 	test("reads default to the active set and skip scopes missing on disk", () => {
@@ -3018,17 +3030,27 @@ describe("scoped memory tools", () => {
 	});
 
 	test("memory_write to another scope is rejected and creates nothing", async () => {
-		const result = await tools.memory_write.execute(
+		const existing = await tools.memory_write.execute(
+			"c1",
+			{ target: "long_term", content: "Nope", scope: "project:other" },
+			null,
+			null,
+			createMockCtx(),
+		);
+		expect(existing.isError).toBe(true);
+		expect(existing.content[0].text).toBe(
+			"scope 'project:other' is not writable; writes target your own scope or global",
+		);
+
+		const unknown = await tools.memory_write.execute(
 			"c1",
 			{ target: "long_term", content: "Nope", scope: "project:ghost" },
 			null,
 			null,
 			createMockCtx(),
 		);
-		expect(result.isError).toBe(true);
-		expect(result.content[0].text).toBe(
-			"scope 'project:ghost' is not writable; writes target your own scope or global",
-		);
+		expect(unknown.isError).toBe(true);
+		expect(unknown.content[0].text).toContain('unknown scope id "project:ghost"');
 		expect(fs.readdirSync(path.join(root, "projects")).sort()).toEqual(["chezmoi-d24458d5", "other-aaaa1111"]);
 	});
 
@@ -3178,6 +3200,32 @@ describe("session_start scope resolution", () => {
 		);
 		const dir = path.join(root, "projects", `${scopeSlug(projectDir)}-${scopeHash(projectDir)}`);
 		expect(fs.readFileSync(path.join(dir, "MEMORY.md"), "utf-8")).toContain("Session fact");
+	});
+
+	test("anchors the scope to the git root when started in a subdirectory", async () => {
+		const repo = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-session-repo-"));
+		const nested = path.join(repo, "packages", "app");
+		fs.mkdirSync(nested, { recursive: true });
+		const gitEnv = { ...process.env };
+		delete gitEnv.GIT_DIR;
+		delete gitEnv.GIT_WORK_TREE;
+		execFileSync("git", ["init", "-q", repo], { stdio: "ignore", env: gitEnv });
+		try {
+			expect(projectRootFor(nested).toLowerCase()).toBe(fs.realpathSync(repo).toLowerCase());
+			await hooks.session_start({}, { ...sessionCtx(), cwd: nested });
+			await tools.memory_write.execute(
+				"c1",
+				{ target: "long_term", content: "Nested fact" },
+				null,
+				null,
+				createMockCtx("scope001234567890"),
+			);
+			const dir = path.join(root, "projects", `${scopeSlug(repo)}-${scopeHash(repo)}`);
+			expect(fs.readFileSync(path.join(dir, "MEMORY.md"), "utf-8")).toContain("Nested fact");
+			expect(fs.existsSync(path.join(root, "projects", `${scopeSlug(nested)}-${scopeHash(nested)}`))).toBe(false);
+		} finally {
+			fs.rmSync(repo, { recursive: true, force: true });
+		}
 	});
 
 	test("PI_MEMORY_SCOPES extras join the active set", async () => {

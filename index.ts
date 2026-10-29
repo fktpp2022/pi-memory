@@ -26,7 +26,7 @@
  *   - MEMORY.md + SCRATCHPAD.md + today's + yesterday's daily logs injected into every turn
  */
 
-import { type ExecFileOptions, execFile } from "node:child_process";
+import { type ExecFileOptions, execFile, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -253,6 +253,28 @@ export function deriveOwnScope(projectRoot: string, slugOverride?: string): { sl
 	return { slug, hash, id: projectScopeId(slug, hash) };
 }
 
+/**
+ * Scope identity is anchored to the project root: the git root, else the cwd.
+ * A session started in a subdirectory belongs to the repository's scope, not
+ * to a scope of its own.
+ */
+export function projectRootFor(cwd: string): string {
+	try {
+		// GIT_DIR/GIT_WORK_TREE are inherited from git hooks and would override -C.
+		const env = { ...process.env };
+		delete env.GIT_DIR;
+		delete env.GIT_WORK_TREE;
+		const out = execFileSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+			env,
+		}).trim();
+		return out ? path.resolve(out) : path.resolve(cwd);
+	} catch {
+		return path.resolve(cwd);
+	}
+}
+
 export interface ProjectConfig {
 	project?: string;
 	scopes?: string[];
@@ -439,9 +461,17 @@ function scopeInfoForId(id: string, ctx: ScopeContext): ScopeDirInfo | null {
 /** Writes target the own scope or `global`; everything else is rejected. */
 export function resolveWritableScope(scope: string | undefined, ctx: ScopeContext): ScopeDirInfo {
 	const own: ScopeDirInfo = { id: ctx.ownScope, dir: ctx.ownDir };
-	if (!scope || scope === ctx.ownScope) return own;
+	if (scope === undefined || scope === ctx.ownScope) return own;
 	if (scope === "global") {
 		return ctx.ownScope === "global" ? own : { id: "global", dir: path.join(ctx.memoryRoot, "global") };
+	}
+	const info = resolveScopeDirectory(ctx.memoryRoot, scope);
+	if (info && info.id === ctx.ownScope) return own;
+	if (!info) {
+		const known = listKnownScopes(ctx.memoryRoot);
+		throw new Error(
+			`unknown scope id "${scope}"; known scopes: ${known.join(", ")} (active: ${ctx.activeScopes.join(", ")})`,
+		);
 	}
 	throw new Error(`scope '${scope}' is not writable; writes target your own scope or global`);
 }
@@ -1887,7 +1917,7 @@ export default function (pi: ExtensionAPI) {
 		// Scope identity is path-bound and resolution happens here, from the
 		// session's cwd — never from process.cwd() (the launch dir).
 		const cwd = typeof ctx.cwd === "string" ? ctx.cwd.trim() : "";
-		if (cwd) applySessionScopeSet(cwd);
+		if (cwd) applySessionScopeSet(projectRootFor(cwd));
 		if (terminalInputUnsubscribe) {
 			terminalInputUnsubscribe();
 			terminalInputUnsubscribe = null;
