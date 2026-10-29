@@ -14,6 +14,7 @@ import * as path from "node:path";
 
 import {
 	_clearEmbedInFlight,
+	_clearQmdStatusCaches,
 	_clearUpdateTimer,
 	_getEmbedInFlight,
 	_getUpdateTimer,
@@ -30,21 +31,28 @@ import {
 	buildQmdEnv,
 	buildQmdSpawn,
 	clampSearchLimit,
+	collectCollectionDiagnostics,
+	collectionNameForScope,
 	dailyPath,
 	dailyPathIn,
 	ensureDirs,
 	ensureQmdEmbed,
+	ensureScopeCollection,
 	forgetBlocks,
 	formatScopedSections,
 	getEmbedProbeTimeoutMs,
 	getExitSummaryReasoningEffort,
 	getExitSummaryTimeoutMs,
 	getQmdSearchTimeoutMs,
+	inspectCollection,
 	isExitSummaryEmpty,
 	isExitSummaryEnabled,
 	listKnownScopes,
 	loadProjectConfig,
 	nowTimestamp,
+	parseQmdCollectionList,
+	parseQmdCollectionShow,
+	parseQmdOrphanedChunks,
 	// scope resolution
 	parseScopeId,
 	parseScopesEnv,
@@ -3236,5 +3244,426 @@ describe("session_start scope resolution", () => {
 		const result = await tools.memory_read.execute("c1", { target: "long_term" }, null, null, {});
 		expect(result.content[0].text).toContain("## Scope: global");
 		expect(result.content[0].text).toContain("Global context");
+	});
+});
+
+// ==========================================================================
+// 16. Per-scope qmd collection lifecycle
+// ==========================================================================
+
+/** Simulated qmd registry: collection name -> path. Records every argv. */
+function mockQmdRegistry(initial: Record<string, string> = {}, statusOutput = "") {
+	const calls: string[][] = [];
+	const collections = new Map<string, string>(Object.entries(initial));
+	const dirsAtAdd: boolean[] = [];
+
+	_setExecFileForTest(((_file: string, args: string[], _opts: any, cb: any) => {
+		calls.push([...args]);
+		const [cmd, sub] = args;
+		if (cmd === "collection" && sub === "show") {
+			const name = args[2];
+			const found = collections.get(name);
+			if (found) {
+				cb(null, `Collection: ${name}\n  Path:     ${found}\n  Pattern:  **/*.md\n  Include:  yes (default)\n`, "");
+			} else {
+				cb(new Error("exit 1"), "", `Collection not found: ${name}\n`);
+			}
+			return;
+		}
+		if (cmd === "collection" && sub === "add") {
+			dirsAtAdd.push(fs.existsSync(args[2]));
+			collections.set(args[4], path.resolve(args[2]));
+			cb(null, "", "");
+			return;
+		}
+		if (cmd === "collection" && sub === "remove") {
+			collections.delete(args[2]);
+			cb(null, "", "");
+			return;
+		}
+		if (cmd === "collection" && sub === "list") {
+			const lines = [...collections.keys()].map((name) => `${name} (qmd://${name}/)`);
+			cb(null, `Collections (${lines.length}):\n\n${lines.join("\n")}\n`, "");
+			return;
+		}
+		if (cmd === "status") {
+			cb(null, statusOutput, "");
+			return;
+		}
+		cb(null, "", "");
+	}) as any);
+
+	return { calls, collections, dirsAtAdd };
+}
+
+describe("scope collection naming", () => {
+	test("keeps the legacy pi-memory name for the global scope", () => {
+		expect(collectionNameForScope("global")).toBe("pi-memory");
+	});
+
+	test("maps a hash-qualified project scope to <slug>-<hash>", () => {
+		expect(collectionNameForScope("project:chezmoi#d24458d5")).toBe("chezmoi-d24458d5");
+	});
+
+	test("derives the name from the scope directory for a bare project id", () => {
+		const dir = path.join("mem", "projects", "chezmoi-d24458d5");
+		expect(collectionNameForScope("project:chezmoi", dir)).toBe("chezmoi-d24458d5");
+	});
+
+	test("returns null for unknown ids and mismatched directories", () => {
+		expect(collectionNameForScope("nonsense")).toBeNull();
+		expect(collectionNameForScope("project:chezmoi")).toBeNull();
+		expect(collectionNameForScope("project:chezmoi", path.join("mem", "projects", "other-aaaa1111"))).toBeNull();
+	});
+});
+
+describe("qmd collection discovery", () => {
+	beforeEach(() => {
+		_clearQmdStatusCaches();
+	});
+
+	afterEach(() => {
+		_resetExecFileForTest();
+		_clearQmdStatusCaches();
+		_setQmdAvailable(false);
+	});
+
+	test("parses the Path line from collection show output", () => {
+		const output = [
+			"Collection: spike-alpha",
+			"  Path:     C:\\mem\\projects\\alpha",
+			"  Pattern:  **/*.md",
+			"  Include:  yes (default)",
+		].join("\n");
+		expect(parseQmdCollectionShow(output)).toEqual({ path: "C:\\mem\\projects\\alpha" });
+	});
+
+	test("treats Collection not found as absent", () => {
+		expect(parseQmdCollectionShow("Collection not found: spike-alpha\n")).toEqual({ path: null });
+	});
+
+	test("reads existence and path via collection show, not list --json", async () => {
+		const sim = mockQmdRegistry({ "spike-alpha": path.resolve("/mem/projects/alpha") });
+		const info = await inspectCollection("spike-alpha");
+		expect(info).toEqual({ exists: true, path: path.resolve("/mem/projects/alpha") });
+		expect(sim.calls).toEqual([["collection", "show", "spike-alpha"]]);
+	});
+
+	test("reports a missing collection from the show error", async () => {
+		const sim = mockQmdRegistry();
+		expect(await inspectCollection("spike-alpha")).toEqual({ exists: false, path: null });
+		expect(sim.calls).toEqual([["collection", "show", "spike-alpha"]]);
+	});
+
+	test("parses collection list names without relying on --json", () => {
+		const output = [
+			"Collections (2):",
+			"",
+			"pi-memory (qmd://pi-memory/)",
+			"  Pattern:  **/*.md",
+			"  Files:    3",
+			"alpha-1234abcd (qmd://alpha-1234abcd/)",
+			"  Pattern:  **/*.md",
+		].join("\n");
+		expect(parseQmdCollectionList(output)).toEqual(["pi-memory", "alpha-1234abcd"]);
+	});
+
+	test("parses orphaned embedding chunks from qmd status", () => {
+		const output =
+			"Documents\n  Total:    3 files indexed\n  Orphaned: 66 embedding chunks (81%) — run 'qmd cleanup'\n";
+		expect(parseQmdOrphanedChunks(output)).toEqual({ count: 66, percent: 81 });
+		expect(parseQmdOrphanedChunks("Documents\n  Total:    3 files indexed\n")).toBeNull();
+	});
+});
+
+describe("ensureScopeCollection", () => {
+	let root: string;
+
+	beforeEach(() => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-collection-"));
+		_clearQmdStatusCaches();
+	});
+
+	afterEach(() => {
+		_resetExecFileForTest();
+		_clearQmdStatusCaches();
+		_setQmdAvailable(false);
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	test("creates a missing collection after the directory exists, then adds the two contexts", async () => {
+		const globalDir = path.join(root, "global");
+		fs.mkdirSync(globalDir, { recursive: true });
+		const sim = mockQmdRegistry();
+
+		expect(await ensureScopeCollection({ id: "global", dir: globalDir })).toBe("created");
+		expect(sim.calls).toEqual([
+			["collection", "show", "pi-memory"],
+			["collection", "add", globalDir, "--name", "pi-memory"],
+			["context", "add", "qmd://pi-memory/daily", "Daily append-only work logs organized by date"],
+			["context", "add", "qmd://pi-memory/", "Curated long-term memory: decisions, preferences, facts, lessons"],
+		]);
+		expect(sim.dirsAtAdd).toEqual([true]);
+		expect(sim.calls.some((args) => args[0] === "cleanup")).toBe(false);
+	});
+
+	test("re-points a project collection with a stale path and re-adds contexts", async () => {
+		const scopeDir = path.join(root, "projects", "chezmoi-d24458d5");
+		fs.mkdirSync(scopeDir, { recursive: true });
+		const sim = mockQmdRegistry({ "chezmoi-d24458d5": path.join(root, "elsewhere") });
+
+		expect(await ensureScopeCollection({ id: "project:chezmoi", dir: scopeDir })).toBe("repointed");
+		expect(sim.calls).toEqual([
+			["collection", "show", "chezmoi-d24458d5"],
+			["collection", "remove", "chezmoi-d24458d5"],
+			["collection", "add", scopeDir, "--name", "chezmoi-d24458d5"],
+			["context", "add", "qmd://chezmoi-d24458d5/daily", "Daily append-only work logs organized by date"],
+			[
+				"context",
+				"add",
+				"qmd://chezmoi-d24458d5/",
+				"Curated long-term memory: decisions, preferences, facts, lessons",
+			],
+		]);
+		expect(sim.dirsAtAdd).toEqual([true]);
+		expect(sim.calls.some((args) => args[0] === "cleanup")).toBe(false);
+	});
+
+	test("leaves a matching collection untouched", async () => {
+		const globalDir = path.join(root, "global");
+		fs.mkdirSync(globalDir, { recursive: true });
+		const sim = mockQmdRegistry({ "pi-memory": path.resolve(globalDir) });
+
+		expect(await ensureScopeCollection({ id: "global", dir: globalDir })).toBe("ready");
+		expect(sim.calls).toEqual([["collection", "show", "pi-memory"]]);
+	});
+
+	test("does not re-point the legacy pi-memory collection while it points at the memory root", async () => {
+		const globalDir = path.join(root, "global");
+		fs.mkdirSync(globalDir, { recursive: true });
+		_setMemoryRoot(root);
+		try {
+			const sim = mockQmdRegistry({ "pi-memory": path.resolve(root) });
+			expect(await ensureScopeCollection({ id: "global", dir: globalDir })).toBe("legacy");
+			expect(sim.calls).toEqual([["collection", "show", "pi-memory"]]);
+			expect(sim.calls.some((args) => args[0] === "cleanup")).toBe(false);
+		} finally {
+			_resetBaseDir();
+		}
+	});
+
+	test("creates nothing when the scope directory does not exist", async () => {
+		const scopeDir = path.join(root, "projects", "ghost-00000000");
+		const sim = mockQmdRegistry();
+
+		expect(await ensureScopeCollection({ id: "project:ghost#00000000", dir: scopeDir })).toBe("no-directory");
+		expect(sim.calls).toEqual([]);
+	});
+});
+
+describe("collection diagnostics", () => {
+	let root: string;
+
+	beforeEach(() => {
+		root = setupScopedRoot();
+		_setMemoryRoot(root);
+		_setScopeSetForTest("project:chezmoi", ["global"]);
+		_clearQmdStatusCaches();
+	});
+
+	afterEach(() => {
+		_resetExecFileForTest();
+		_resetBaseDir();
+		_clearQmdStatusCaches();
+		_setQmdAvailable(false);
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	test("reports per-scope state and collections whose scope directory is missing", async () => {
+		const chezmoiDir = path.join(root, "projects", "chezmoi-d24458d5");
+		mockQmdRegistry(
+			{
+				"pi-memory": path.join(root, "global"),
+				"chezmoi-d24458d5": chezmoiDir,
+				"old-1111aaaa": path.join(root, "projects", "old-1111aaaa"),
+			},
+			"Documents\n  Orphaned: 66 embedding chunks (81%) — run 'qmd cleanup'\n",
+		);
+
+		const diagnostics = await collectCollectionDiagnostics();
+		expect(diagnostics.scopes.map((scope) => [scope.scope, scope.name, scope.exists])).toEqual([
+			["project:chezmoi", "chezmoi-d24458d5", true],
+			["global", "pi-memory", true],
+		]);
+		expect(diagnostics.orphans).toEqual([
+			{ name: "old-1111aaaa", path: path.resolve(path.join(root, "projects", "old-1111aaaa")), reason: "missing" },
+		]);
+		expect(diagnostics.orphanChunks).toEqual({ count: 66, percent: 81 });
+	});
+
+	test("flags a registered collection whose path does not match its scope directory", async () => {
+		mockQmdRegistry({
+			"pi-memory": path.join(root, "global"),
+			"chezmoi-d24458d5": path.join(root, "elsewhere"),
+		});
+
+		const diagnostics = await collectCollectionDiagnostics();
+		expect(diagnostics.orphans).toEqual([
+			{ name: "chezmoi-d24458d5", path: path.resolve(path.join(root, "elsewhere")), reason: "mismatch" },
+		]);
+	});
+});
+
+describe("session_start collection lifecycle", () => {
+	let root: string;
+	let projectDir: string;
+	let hooks: Record<string, (...args: unknown[]) => unknown>;
+	let sim: ReturnType<typeof mockQmdRegistry>;
+
+	beforeEach(() => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-lifecycle-root-"));
+		projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-lifecycle-proj-"));
+		_setMemoryRoot(root);
+		_resetMemorySnapshot();
+		process.env.PI_MEMORY_SCOPES = "global";
+		fs.mkdirSync(path.join(root, "global"), { recursive: true });
+		fs.mkdirSync(path.join(root, "projects", `${scopeSlug(projectDir)}-${scopeHash(projectDir)}`), {
+			recursive: true,
+		});
+		_clearQmdStatusCaches();
+		_setQmdAvailable(true);
+		sim = mockQmdRegistry();
+		const mockPi = createMockPi();
+		hooks = mockPi.hooks;
+		registerExtension(mockPi.pi as any);
+	});
+
+	afterEach(() => {
+		delete process.env.PI_MEMORY_SCOPES;
+		_resetExecFileForTest();
+		_resetBaseDir();
+		_setQmdAvailable(false);
+		_clearUpdateTimer();
+		_clearEmbedInFlight();
+		_clearQmdStatusCaches();
+		fs.rmSync(root, { recursive: true, force: true });
+		fs.rmSync(projectDir, { recursive: true, force: true });
+	});
+
+	const sessionCtx = () => ({
+		cwd: projectDir,
+		hasUI: false,
+		sessionManager: { getSessionId: () => "life001" },
+		ui: { notify: () => {} },
+	});
+
+	test("creates a collection for every active scope whose directory exists", async () => {
+		await hooks.session_start({}, sessionCtx());
+		const added = sim.calls.filter((args) => args[0] === "collection" && args[1] === "add").map((args) => args[4]);
+		const ownCollection = `${scopeSlug(projectDir)}-${scopeHash(projectDir)}`;
+		expect(added.sort()).toEqual([ownCollection, "pi-memory"].sort());
+		expect(sim.dirsAtAdd).toEqual([true, true]);
+		expect(sim.calls.some((args) => args[0] === "cleanup")).toBe(false);
+	});
+
+	test("skips an active scope whose directory does not exist", async () => {
+		fs.rmSync(path.join(root, "global"), { recursive: true, force: true });
+		await hooks.session_start({}, sessionCtx());
+		const added = sim.calls.filter((args) => args[0] === "collection" && args[1] === "add").map((args) => args[4]);
+		expect(added).toEqual([`${scopeSlug(projectDir)}-${scopeHash(projectDir)}`]);
+	});
+});
+
+describe("lazy collection creation on write", () => {
+	let root: string;
+	let tools: Record<string, any>;
+	let sim: ReturnType<typeof mockQmdRegistry>;
+
+	beforeEach(() => {
+		root = setupScopedRoot();
+		_setMemoryRoot(root);
+		_setScopeSetForTest("project:chezmoi");
+		process.env.PI_MEMORY_QMD_UPDATE = "off";
+		fs.rmSync(path.join(root, "global"), { recursive: true, force: true });
+		_clearQmdStatusCaches();
+		_setQmdAvailable(true);
+		sim = mockQmdRegistry();
+		const mockPi = createMockPi();
+		tools = mockPi.tools;
+		registerExtension(mockPi.pi as any);
+	});
+
+	afterEach(() => {
+		delete process.env.PI_MEMORY_QMD_UPDATE;
+		_resetExecFileForTest();
+		_resetBaseDir();
+		_setQmdAvailable(false);
+		_clearQmdStatusCaches();
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	test("a write to global creates its directory before its collection", async () => {
+		await tools.memory_write.execute(
+			"c1",
+			{ target: "long_term", content: "Global fact", scope: "global" },
+			null,
+			null,
+			createMockCtx(),
+		);
+		const globalDir = path.join(root, "global");
+		expect(fs.existsSync(path.join(globalDir, "MEMORY.md"))).toBe(true);
+		expect(sim.collections.get("pi-memory")).toBe(path.resolve(globalDir));
+		expect(sim.dirsAtAdd).toEqual([true]);
+		expect(sim.calls).toEqual([
+			["collection", "show", "pi-memory"],
+			["collection", "add", globalDir, "--name", "pi-memory"],
+			["context", "add", "qmd://pi-memory/daily", "Daily append-only work logs organized by date"],
+			["context", "add", "qmd://pi-memory/", "Curated long-term memory: decisions, preferences, facts, lessons"],
+		]);
+	});
+});
+
+describe("memory_status collections", () => {
+	let root: string;
+	let tools: Record<string, any>;
+
+	beforeEach(() => {
+		root = setupScopedRoot();
+		_setMemoryRoot(root);
+		_setScopeSetForTest("project:chezmoi", ["global"]);
+		_clearQmdStatusCaches();
+		_setQmdAvailable(true);
+		mockQmdRegistry(
+			{
+				"pi-memory": path.join(root, "global"),
+				"chezmoi-d24458d5": path.join(root, "projects", "chezmoi-d24458d5"),
+				"old-1111aaaa": path.join(root, "projects", "old-1111aaaa"),
+			},
+			"Documents\n  Orphaned: 66 embedding chunks (81%) — run 'qmd cleanup'\n",
+		);
+		const mockPi = createMockPi();
+		tools = mockPi.tools;
+		registerExtension(mockPi.pi as any);
+	});
+
+	afterEach(() => {
+		_resetExecFileForTest();
+		_resetBaseDir();
+		_setQmdAvailable(false);
+		_clearQmdStatusCaches();
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	test("reports per-scope collections, orphans, and orphaned embedding chunks", async () => {
+		const result = await tools.memory_status.execute("c1", {}, null, null, createMockCtx());
+		const text = result.content[0].text;
+		expect(text).toContain("## Collections");
+		expect(text).toContain("`project:chezmoi` → `chezmoi-d24458d5`: ✓");
+		expect(text).toContain("`global` → `pi-memory`: ✓");
+		expect(text).toContain("## Orphan collections");
+		expect(text).toContain("`old-1111aaaa`");
+		expect(text).toContain("qmd collection remove old-1111aaaa");
+		expect(text).toContain("Orphaned embedding chunks: 66 (81%)");
+		expect(text).toContain("qmd cleanup");
 	});
 });

@@ -1371,7 +1371,7 @@ const QMD_STATUS_CACHE_TTL_MS = 5 * 60 * 1000;
 const QMD_STATUS_NEGATIVE_CACHE_TTL_MS = 5 * 1000;
 const DEFAULT_QMD_SEARCH_TIMEOUT_MS = 60_000;
 const DEFAULT_EMBED_PROBE_TIMEOUT_MS = 15_000;
-const qmdCollectionStatusCache = new Map<string, { checkedAt: number; exists: boolean }>();
+const qmdCollectionStatusCache = new Map<string, { checkedAt: number; exists: boolean; path: string | null }>();
 
 function qmdStatusTtl(positive: boolean): number {
 	return positive ? QMD_STATUS_CACHE_TTL_MS : QMD_STATUS_NEGATIVE_CACHE_TTL_MS;
@@ -1457,39 +1457,238 @@ export function qmdCollectionInstructions(): string {
 	].join("\n");
 }
 
-/** Auto-create the pi-memory collection and path contexts in qmd. */
-export async function setupQmdCollection(): Promise<boolean> {
-	try {
-		await new Promise<void>((resolve, reject) => {
-			execFileFn("qmd", ["collection", "add", MEMORY_DIR, "--name", "pi-memory"], { timeout: 10_000 }, (err) =>
-				err ? reject(err) : resolve(),
-			);
-		});
-	} catch {
-		// Collection may already exist under a different name — not critical
-		return false;
+const GLOBAL_COLLECTION_NAME = "pi-memory";
+const QMD_CONTEXT_SPECS: Array<[string, string]> = [
+	["daily", "Daily append-only work logs organized by date"],
+	["", "Curated long-term memory: decisions, preferences, facts, lessons"],
+];
+
+/**
+ * Collection name for a scope. `global` keeps the legacy `pi-memory` name;
+ * a project collection is named after its scope directory (`<slug>-<hash>`).
+ * No mapping is stored — this rule is the whole mapping.
+ */
+export function collectionNameForScope(scopeId: string, dir?: string): string | null {
+	const parsed = parseScopeId(scopeId);
+	if (!parsed) return null;
+	if (parsed.kind === "global") return GLOBAL_COLLECTION_NAME;
+	if (parsed.hash) return scopeDirName(parsed.slug as string, parsed.hash);
+	if (!dir) return null;
+	const base = path.basename(dir);
+	const match = SCOPE_DIR_REGEX.exec(base);
+	return match && match[1] === parsed.slug ? base : null;
+}
+
+export function parseQmdCollectionShow(output: string): { path: string | null } {
+	const match = output.match(/^\s*Path:\s*(.+?)\s*$/m);
+	return { path: match ? match[1] : null };
+}
+
+export function qmdPathsEqual(a: string | null | undefined, b: string | null | undefined): boolean {
+	if (!a || !b) return false;
+	const normalize = (p: string) => path.resolve(p).replace(/\\/g, "/").replace(/\/+$/, "");
+	const left = normalize(a);
+	const right = normalize(b);
+	return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
+
+export function parseQmdCollectionList(output: string): string[] {
+	const names: string[] = [];
+	for (const line of output.split(/\r?\n/)) {
+		const match = line.match(/^(\S+) \(qmd:\/\/[^/]+\/\)/);
+		if (match && !names.includes(match[1])) names.push(match[1]);
+	}
+	return names;
+}
+
+export function parseQmdOrphanedChunks(output: string): { count: number; percent: number } | null {
+	const match = output.match(/Orphaned:\s*(\d+)\s+embedding chunks(?:\s*\((\d+)%\))?/i);
+	if (!match) return null;
+	const count = Number(match[1]);
+	return count > 0 ? { count, percent: Number(match[2] ?? 0) } : null;
+}
+
+export interface QmdCollectionInfo {
+	exists: boolean;
+	path: string | null;
+}
+
+/**
+ * Read a collection's path via `qmd collection show`. qmd 2.8.3 ignores
+ * `--json` on `collection list`, so the human `Path:` line is the reliable
+ * fact; a missing collection exits 1 with `Collection not found: <name>`.
+ */
+export function inspectCollection(name: string): Promise<QmdCollectionInfo> {
+	const cached = qmdCollectionStatusCache.get(name);
+	const now = Date.now();
+	if (cached && now - cached.checkedAt < qmdStatusTtl(cached.exists)) {
+		return Promise.resolve({ exists: cached.exists, path: cached.path });
 	}
 
-	// Add path contexts (best-effort, ignore errors)
-	const contexts: [string, string][] = [
-		["/daily", "Daily append-only work logs organized by date"],
-		["/", "Curated long-term memory: decisions, preferences, facts, lessons"],
-	];
-	for (const [ctxPath, desc] of contexts) {
-		try {
-			await new Promise<void>((resolve, reject) => {
-				execFileFn("qmd", ["context", "add", ctxPath, desc, "-c", "pi-memory"], { timeout: 10_000 }, (err) =>
-					err ? reject(err) : resolve(),
-				);
-			});
-		} catch {
-			// Ignore — context may already exist
+	return new Promise((resolve) => {
+		execFileFn("qmd", ["collection", "show", name], { timeout: 10_000 }, (_err, stdout, stderr) => {
+			const parsed = parseQmdCollectionShow(`${stdout ?? ""}\n${stderr ?? ""}`);
+			const info: QmdCollectionInfo = { exists: parsed.path !== null, path: parsed.path };
+			qmdCollectionStatusCache.set(name, { checkedAt: Date.now(), ...info });
+			resolve(info);
+		});
+	});
+}
+
+export function checkCollection(name: string): Promise<boolean> {
+	return inspectCollection(name).then((info) => info.exists);
+}
+
+function runQmd(args: string[], timeout = 10_000): Promise<boolean> {
+	return new Promise((resolve) => {
+		execFileFn("qmd", args, { timeout }, (err) => resolve(!err));
+	});
+}
+
+async function addCollectionContexts(name: string): Promise<void> {
+	for (const [subPath, description] of QMD_CONTEXT_SPECS) {
+		// Best-effort: a context may already exist.
+		await runQmd(["context", "add", `qmd://${name}/${subPath}`, description]);
+	}
+}
+
+export type ScopeCollectionState = "ready" | "created" | "repointed" | "legacy" | "no-directory" | "failed";
+
+/**
+ * Bring one scope's collection in line with its directory. The directory must
+ * exist first: a scope with no directory gets no collection.
+ */
+export async function ensureScopeCollection(scope: ScopeDirInfo): Promise<ScopeCollectionState> {
+	const name = collectionNameForScope(scope.id, scope.dir);
+	if (!name) return "failed";
+	if (!fs.existsSync(scope.dir)) return "no-directory";
+
+	try {
+		const current = await inspectCollection(name);
+		if (current.exists && qmdPathsEqual(current.path, scope.dir)) return "ready";
+
+		if (current.exists) {
+			// The one-time migration owns the legacy global re-point: while
+			// `pi-memory` still indexes the memory root, moving it would make the
+			// user's not-yet-migrated memory vanish from search.
+			if (name === GLOBAL_COLLECTION_NAME && qmdPathsEqual(current.path, memoryRoot)) return "legacy";
+			if (!(await runQmd(["collection", "remove", name]))) return "failed";
+			qmdCollectionStatusCache.delete(name);
+		}
+
+		if (!(await runQmd(["collection", "add", scope.dir, "--name", name]))) return "failed";
+		// Removing a collection drops its contexts, so they are (re)added here.
+		await addCollectionContexts(name);
+		qmdCollectionStatusCache.set(name, { checkedAt: Date.now(), exists: true, path: scope.dir });
+		return current.exists ? "repointed" : "created";
+	} catch {
+		return "failed";
+	}
+}
+
+/** Create collections for every active scope whose directory already exists. */
+export async function ensureActiveScopeCollections(ctx: ScopeContext = scopeContext()): Promise<void> {
+	for (const id of ctx.activeScopes) {
+		const info = scopeInfoForId(id, ctx);
+		if (!info || !fs.existsSync(info.dir)) continue;
+		await ensureScopeCollection(info);
+	}
+}
+
+async function ensureScopeCollectionIfAvailable(scope: ScopeDirInfo): Promise<void> {
+	if (!qmdAvailable) return;
+	await ensureScopeCollection(scope);
+}
+
+/**
+ * Deprecated: the global collection is now managed by the per-scope lifecycle.
+ * Kept for callers that only know the legacy setup step.
+ */
+export async function setupQmdCollection(): Promise<boolean> {
+	const state = await ensureScopeCollection({ id: "global", dir: path.join(memoryRoot, "global") });
+	return state === "ready" || state === "created" || state === "repointed";
+}
+
+function expectedScopeDirForCollection(name: string): string | null {
+	if (name === GLOBAL_COLLECTION_NAME) return path.join(memoryRoot, "global");
+	return SCOPE_DIR_REGEX.test(name) ? path.join(memoryRoot, "projects", name) : null;
+}
+
+function listQmdCollections(): Promise<string[]> {
+	return new Promise((resolve) => {
+		execFileFn("qmd", ["collection", "list"], { timeout: 10_000 }, (err, stdout) =>
+			resolve(err ? [] : parseQmdCollectionList(stdout ?? "")),
+		);
+	});
+}
+
+function probeOrphanedChunks(): Promise<{ count: number; percent: number } | null> {
+	return new Promise((resolve) => {
+		execFileFn("qmd", ["status"], { timeout: 30_000 }, (err, stdout) =>
+			resolve(err ? null : parseQmdOrphanedChunks(stdout ?? "")),
+		);
+	});
+}
+
+export interface ScopeCollectionDiagnostic {
+	scope: string;
+	name: string | null;
+	dir: string;
+	dirExists: boolean;
+	exists: boolean;
+	path: string | null;
+}
+
+export interface OrphanCollectionDiagnostic {
+	name: string;
+	path: string;
+	reason: "missing" | "mismatch";
+}
+
+export interface CollectionDiagnostics {
+	scopes: ScopeCollectionDiagnostic[];
+	orphans: OrphanCollectionDiagnostic[];
+	orphanChunks: { count: number; percent: number } | null;
+}
+
+/**
+ * Read-only view used by memory_status: per-scope collection state plus
+ * collections produced by the naming rule that no longer have a scope
+ * directory to index. Nothing is removed here.
+ */
+export async function collectCollectionDiagnostics(ctx: ScopeContext = scopeContext()): Promise<CollectionDiagnostics> {
+	const scopes: ScopeCollectionDiagnostic[] = [];
+	for (const id of ctx.activeScopes) {
+		const info = scopeInfoForId(id, ctx);
+		if (!info) continue;
+		const name = collectionNameForScope(info.id, info.dir);
+		const collection = name ? await inspectCollection(name) : { exists: false, path: null };
+		scopes.push({
+			scope: info.id,
+			name,
+			dir: info.dir,
+			dirExists: fs.existsSync(info.dir),
+			exists: collection.exists,
+			path: collection.path,
+		});
+	}
+
+	const orphans: OrphanCollectionDiagnostic[] = [];
+	for (const name of await listQmdCollections()) {
+		const expectedDir = expectedScopeDirForCollection(name);
+		if (!expectedDir) continue;
+		const collection = await inspectCollection(name);
+		if (!collection.exists || !collection.path) continue;
+		// The migration owns the legacy global re-point; never call it an orphan.
+		if (name === GLOBAL_COLLECTION_NAME && qmdPathsEqual(collection.path, memoryRoot)) continue;
+		if (!fs.existsSync(expectedDir)) {
+			orphans.push({ name, path: collection.path, reason: "missing" });
+		} else if (!qmdPathsEqual(collection.path, expectedDir)) {
+			orphans.push({ name, path: collection.path, reason: "mismatch" });
 		}
 	}
-	// Seed the cache so checkCollection("pi-memory") doesn't redundantly re-run
-	// setupQmdCollection during the short negative-cache window.
-	qmdCollectionStatusCache.set("pi-memory", { checkedAt: Date.now(), exists: true });
-	return true;
+
+	return { scopes, orphans, orphanChunks: await probeOrphanedChunks() };
 }
 
 export function detectQmd(): Promise<boolean> {
@@ -1506,42 +1705,6 @@ export function detectQmd(): Promise<boolean> {
 			qmdAvailable = !err;
 			qmdAvailabilityCheckedAt = Date.now();
 			resolve(qmdAvailable);
-		});
-	});
-}
-
-export function checkCollection(name: string): Promise<boolean> {
-	const cached = qmdCollectionStatusCache.get(name);
-	const now = Date.now();
-	if (cached && now - cached.checkedAt < qmdStatusTtl(cached.exists)) {
-		return Promise.resolve(cached.exists);
-	}
-
-	return new Promise((resolve) => {
-		execFileFn("qmd", ["collection", "list", "--json"], { timeout: 10_000 }, (err, stdout) => {
-			let exists = false;
-			if (!err) {
-				try {
-					const collections = JSON.parse(stdout);
-					if (Array.isArray(collections)) {
-						exists = collections.some((entry) => {
-							if (typeof entry === "string") return entry === name;
-							if (entry && typeof entry === "object" && "name" in entry) {
-								return (entry as { name?: string }).name === name;
-							}
-							return false;
-						});
-					} else {
-						// qmd may output an object with a collections array or similar
-						exists = stdout.includes(name);
-					}
-				} catch {
-					// Fallback: just check if the name appears in the output
-					exists = stdout.includes(name);
-				}
-			}
-			qmdCollectionStatusCache.set(name, { checkedAt: Date.now(), exists });
-			resolve(exists);
 		});
 	});
 }
@@ -1941,10 +2104,10 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		const hasCollection = await checkCollection("pi-memory");
-		if (!hasCollection) {
-			await setupQmdCollection();
-		}
+		// The own scope directory belongs to this session; extra scopes only get
+		// collections when their directories already exist.
+		ensureDirs();
+		await ensureActiveScopeCollections();
 		// Catch-up embed: covers writes from previous sessions (shutdown skips
 		// embedding) and fresh installs where the collection exists but was
 		// never embedded. Incremental, so a no-op when already current.
@@ -2170,6 +2333,7 @@ export default function (pi: ExtensionAPI) {
 				return toolError(err);
 			}
 			ensureScopeDirs(scope.dir);
+			await ensureScopeCollectionIfAvailable(scope);
 			const sid = shortSessionId(ctx.sessionManager.getSessionId());
 			const ts = nowTimestamp();
 
@@ -2300,6 +2464,7 @@ export default function (pi: ExtensionAPI) {
 				return toolError(err);
 			}
 			ensureScopeDirs(scope.dir);
+			if (action !== "list") await ensureScopeCollectionIfAvailable(scope);
 			const scratchpadFile = path.join(scope.dir, "SCRATCHPAD.md");
 			const sid = shortSessionId(ctx.sessionManager.getSessionId());
 			const ts = nowTimestamp();
@@ -2757,12 +2922,17 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			let hasCollection = await checkCollection("pi-memory");
+			let hasCollection = await checkCollection(GLOBAL_COLLECTION_NAME);
 			if (!hasCollection) {
-				const created = await setupQmdCollection();
-				if (created) {
-					hasCollection = true;
-				}
+				// memory_search still targets the global collection; a project
+				// scope's collection is created at session start or on write.
+				const scopeState = scopeContext();
+				const globalScope: ScopeDirInfo =
+					scopeState.ownScope === "global"
+						? { id: "global", dir: scopeState.ownDir }
+						: { id: "global", dir: path.join(scopeState.memoryRoot, "global") };
+				const state = await ensureScopeCollection(globalScope);
+				hasCollection = state === "ready" || state === "created" || state === "repointed";
 			}
 			if (!hasCollection) {
 				return {
@@ -2868,8 +3038,11 @@ export default function (pi: ExtensionAPI) {
 			const qmdOk = qmdAvailable || (await detectQmd());
 			let collectionOk = false;
 			let embeddings: "ready" | "missing" | "unknown" | "n/a" = "n/a";
+			let diagnostics: CollectionDiagnostics | null = null;
 			if (qmdOk) {
-				collectionOk = await checkCollection("pi-memory");
+				diagnostics = await collectCollectionDiagnostics();
+				collectionOk = diagnostics.scopes.some((scope) => scope.scope === "global" && scope.exists);
+				if (!collectionOk) collectionOk = await checkCollection(GLOBAL_COLLECTION_NAME);
 				embeddings = collectionOk ? await probeEmbeddings() : "n/a";
 			}
 
@@ -2889,7 +3062,7 @@ export default function (pi: ExtensionAPI) {
 			];
 
 			if (qmdOk) {
-				lines.push(`- Collection \`pi-memory\`: ${mark(collectionOk)}`);
+				lines.push(`- Collection \`${GLOBAL_COLLECTION_NAME}\`: ${mark(collectionOk)}`);
 				if (collectionOk) {
 					const embMark = embeddings === "ready" ? "✓" : embeddings === "missing" ? "⚠" : "?";
 					lines.push(`- Embeddings (semantic/deep): ${embMark} ${embeddings}`);
@@ -2907,6 +3080,38 @@ export default function (pi: ExtensionAPI) {
 					}
 				} else {
 					lines.push("  - Run a `memory_search` (auto-creates it) or `qmd collection add` manually.");
+				}
+
+				if (diagnostics) {
+					lines.push("", "## Collections");
+					for (const scope of diagnostics.scopes) {
+						const label = `\`${scope.scope}\` → \`${scope.name ?? "?"}\``;
+						if (!scope.dirExists) {
+							lines.push(`- ${label}: directory missing (no collection expected)`);
+						} else if (scope.exists) {
+							lines.push(`- ${label}: ✓ ${scope.path ?? scope.dir}`);
+						} else {
+							lines.push(`- ${label}: ✗ not created`);
+						}
+					}
+					if (diagnostics.orphans.length > 0 || diagnostics.orphanChunks) {
+						lines.push("", "## Orphan collections");
+						for (const orphan of diagnostics.orphans) {
+							const reason =
+								orphan.reason === "missing"
+									? "scope directory missing"
+									: "path does not match the scope directory";
+							lines.push(
+								`- \`${orphan.name}\` — ${orphan.path} (${reason})`,
+								`  Remove: \`qmd collection remove ${orphan.name}\``,
+							);
+						}
+						if (diagnostics.orphanChunks) {
+							lines.push(
+								`- Orphaned embedding chunks: ${diagnostics.orphanChunks.count} (${diagnostics.orphanChunks.percent}%) — run \`qmd cleanup\` to reclaim them.`,
+							);
+						}
+					}
 				}
 			} else {
 				lines.push("", qmdInstallInstructions());
@@ -2933,6 +3138,9 @@ export default function (pi: ExtensionAPI) {
 					qmd: qmdOk,
 					collection: collectionOk,
 					embeddings,
+					collections: diagnostics?.scopes ?? [],
+					orphanCollections: diagnostics?.orphans ?? [],
+					orphanChunks: diagnostics?.orphanChunks ?? null,
 					snapshotMode: getSnapshotMode(),
 					qmdUpdateMode: getQmdUpdateMode(),
 				},
