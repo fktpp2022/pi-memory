@@ -2082,6 +2082,708 @@ function toolError(err: unknown) {
 	};
 }
 
+// ---------------------------------------------------------------------------
+// Migration (spec chapter 7): /memory migrate plan/apply/undo
+//
+// The planner is pure: it reads the source/target layout and returns plain
+// data. Execution performs exactly the listed actions, files first and qmd
+// second. Nothing here registers a pi command; the /memory command in ticket
+// #16 calls runMemoryMigrate().
+// ---------------------------------------------------------------------------
+
+let extensionsDirOverride: string | null = null;
+
+/** Override the extensions directory (for testing); null restores the default. */
+export function _setExtensionsDirForTest(dir: string | null) {
+	extensionsDirOverride = dir;
+}
+
+/**
+ * Default extensions directory, derived from the memory root so no homedir
+ * lookup leaks into the planner: `~/.pi/agent/memory` -> `~/.pi/agent/extensions`.
+ */
+function defaultExtensionsDir(): string {
+	return path.join(path.dirname(memoryRoot), "extensions");
+}
+
+function resolveExtensionsDir(): string {
+	return extensionsDirOverride ?? defaultExtensionsDir();
+}
+
+export type MigrateActionStatus = "pending" | "done" | "skipped" | "failed";
+export type MigrateCollectionAction = "repoint" | "create";
+
+export interface MigrateMoveAction {
+	kind: "move";
+	/** Path relative to the memory root, with `/` separators. */
+	from: string;
+	/** Path relative to the memory root, with `/` separators. */
+	to: string;
+	dir: boolean;
+	files: number;
+	bytes: number;
+	conflict: boolean;
+	status: MigrateActionStatus;
+}
+
+export interface MigrateKeepAction {
+	kind: "keep";
+	entry: string;
+	status: "skipped";
+}
+
+export interface MigrateRemoveCollectionAction {
+	kind: "removeCollection";
+	name: string;
+	path: string | null;
+	status: MigrateActionStatus;
+}
+
+export interface MigrateAddCollectionAction {
+	kind: "addCollection";
+	name: string;
+	path: string;
+	manifestAction: MigrateCollectionAction;
+	status: MigrateActionStatus;
+}
+
+export interface MigrateAddContextAction {
+	kind: "addContext";
+	collection: string;
+	/** `daily` or the empty string for the collection root. */
+	subPath: string;
+	status: MigrateActionStatus;
+}
+
+export interface MigrateUpdateIndexAction {
+	kind: "updateIndex";
+	status: MigrateActionStatus;
+}
+
+export type MigrateAction =
+	| MigrateMoveAction
+	| MigrateKeepAction
+	| MigrateRemoveCollectionAction
+	| MigrateAddCollectionAction
+	| MigrateAddContextAction
+	| MigrateUpdateIndexAction;
+
+export interface MigratePlanInput {
+	memoryRoot: string;
+	extensionsDir: string;
+	qmdAvailable: boolean;
+	/** Existing qmd collections: name -> indexed path. Absent when qmd is unavailable. */
+	collections?: Record<string, string | null>;
+}
+
+export interface MigratePlan {
+	mode: "migrate" | "undo";
+	memoryRoot: string;
+	qmdAvailable: boolean;
+	memoryScopePresent: boolean;
+	actions: MigrateAction[];
+	fileOperations: number;
+	collectionOperations: number;
+	conflicts: number;
+	hasRemovals: boolean;
+	alreadyMigrated: boolean;
+}
+
+export interface MigrationManifest {
+	version: 1;
+	timestamp: string;
+	moves: Array<{ from: string; to: string }>;
+	collections: Array<{ name: string; action: MigrateCollectionAction; path: string }>;
+	contexts: Array<{ collection: string; path: string }>;
+}
+
+const MIGRATION_FILE_ENTRIES = ["MEMORY.md", "SCRATCHPAD.md", "daily", "recovery"];
+const MIGRATION_LAYOUT_ENTRIES = new Set([...MIGRATION_FILE_ENTRIES, "global", "projects", ".migration-manifest.json"]);
+
+function inspectTree(target: string): { files: number; bytes: number } {
+	let stat: fs.Stats;
+	try {
+		stat = fs.statSync(target);
+	} catch {
+		return { files: 0, bytes: 0 };
+	}
+	if (!stat.isDirectory()) return { files: 1, bytes: stat.size };
+	let files = 0;
+	let bytes = 0;
+	for (const entry of fs.readdirSync(target)) {
+		const child = inspectTree(path.join(target, entry));
+		files += child.files;
+		bytes += child.bytes;
+	}
+	return { files, bytes };
+}
+
+function planMoveAction(root: string, fromRel: string, toRel: string): MigrateMoveAction | null {
+	const fromAbs = path.join(root, fromRel);
+	const toAbs = path.join(root, toRel);
+	let stat: fs.Stats;
+	try {
+		stat = fs.lstatSync(fromAbs);
+	} catch {
+		return null;
+	}
+	const tree = inspectTree(fromAbs);
+	const conflict = fs.existsSync(toAbs);
+	return {
+		kind: "move",
+		from: fromRel.split(path.sep).join("/"),
+		to: toRel.split(path.sep).join("/"),
+		dir: stat.isDirectory(),
+		files: tree.files,
+		bytes: tree.bytes,
+		conflict,
+		status: conflict ? "skipped" : "pending",
+	};
+}
+
+function buildMigratePlan(
+	mode: MigratePlan["mode"],
+	input: MigratePlanInput,
+	memoryScopePresent: boolean,
+	actions: MigrateAction[],
+	alreadyMigrated: boolean,
+): MigratePlan {
+	return {
+		mode,
+		memoryRoot: input.memoryRoot,
+		qmdAvailable: input.qmdAvailable,
+		memoryScopePresent,
+		actions,
+		fileOperations: actions.filter((action) => action.kind === "move" || action.kind === "keep").length,
+		collectionOperations: actions.filter(
+			(action) => action.kind === "removeCollection" || action.kind === "addCollection",
+		).length,
+		conflicts: actions.filter((action) => action.kind === "move" && action.conflict).length,
+		hasRemovals: actions.some((action) => action.kind === "removeCollection"),
+		alreadyMigrated,
+	};
+}
+
+/**
+ * Pure planner for `--apply`: the legacy entries still at the top level move
+ * into global/, `projects/<dir>/` is adopted as-is, unrecognised entries stay
+ * put, and qmd is re-pointed only after the moves.
+ */
+export function planMemoryMigration(input: MigratePlanInput): MigratePlan {
+	const root = input.memoryRoot;
+	const collections = input.collections ?? {};
+	const memoryScopePresent = fs.existsSync(path.join(input.extensionsDir, "memory-scope.ts"));
+	const actions: MigrateAction[] = [];
+
+	for (const entry of MIGRATION_FILE_ENTRIES) {
+		const move = planMoveAction(root, entry, `global/${entry}`);
+		if (move) actions.push(move);
+	}
+
+	let topLevel: fs.Dirent[] = [];
+	try {
+		topLevel = fs.readdirSync(root, { withFileTypes: true });
+	} catch {
+		topLevel = [];
+	}
+	for (const entry of [...topLevel].sort((a, b) => a.name.localeCompare(b.name))) {
+		if (MIGRATION_LAYOUT_ENTRIES.has(entry.name)) continue;
+		actions.push({ kind: "keep", entry: entry.name, status: "skipped" });
+	}
+
+	const hasFileWork = actions.some((action) => action.kind === "move");
+	// Without qmd the collections cannot be inspected; a layout with no file
+	// work left is migrated as far as this command can tell.
+	if (!input.qmdAvailable && !hasFileWork) {
+		return buildMigratePlan("migrate", input, memoryScopePresent, actions, true);
+	}
+
+	const qmdStatus: MigrateActionStatus = input.qmdAvailable ? "pending" : "skipped";
+	const collectionActions: MigrateAction[] = [];
+	const globalDir = path.join(root, "global");
+	const currentGlobal = collections[GLOBAL_COLLECTION_NAME];
+	const globalRegistered = typeof currentGlobal === "string";
+	const globalAtTarget = globalRegistered && qmdPathsEqual(currentGlobal, globalDir);
+	if (globalRegistered && !globalAtTarget) {
+		collectionActions.push({
+			kind: "removeCollection",
+			name: GLOBAL_COLLECTION_NAME,
+			path: currentGlobal,
+			status: qmdStatus,
+		});
+	}
+	if (!globalAtTarget) {
+		collectionActions.push({
+			kind: "addCollection",
+			name: GLOBAL_COLLECTION_NAME,
+			path: globalDir,
+			manifestAction: globalRegistered ? "repoint" : "create",
+			status: qmdStatus,
+		});
+		for (const [subPath] of QMD_CONTEXT_SPECS) {
+			collectionActions.push({ kind: "addContext", collection: GLOBAL_COLLECTION_NAME, subPath, status: qmdStatus });
+		}
+	}
+	for (const scope of scanProjectScopes(root)) {
+		const name = path.basename(scope.dir);
+		if (typeof collections[name] === "string") continue;
+		collectionActions.push({
+			kind: "addCollection",
+			name,
+			path: scope.dir,
+			manifestAction: "create",
+			status: qmdStatus,
+		});
+		for (const [subPath] of QMD_CONTEXT_SPECS) {
+			collectionActions.push({ kind: "addContext", collection: name, subPath, status: qmdStatus });
+		}
+	}
+	if (collectionActions.length > 0) {
+		actions.push(...collectionActions, { kind: "updateIndex", status: qmdStatus });
+	}
+
+	const alreadyMigrated = !hasFileWork && collectionActions.length === 0;
+	return buildMigratePlan("migrate", input, memoryScopePresent, actions, alreadyMigrated);
+}
+
+/** Pure planner for `--undo`: replay the manifest in reverse. */
+export function planMemoryUndo(input: MigratePlanInput, manifest: MigrationManifest): MigratePlan {
+	const root = input.memoryRoot;
+	const collections = input.collections ?? {};
+	const memoryScopePresent = fs.existsSync(path.join(input.extensionsDir, "memory-scope.ts"));
+	const actions: MigrateAction[] = [];
+
+	for (const move of [...manifest.moves].reverse()) {
+		const action = planMoveAction(root, move.to, move.from);
+		if (action) actions.push(action);
+	}
+
+	const qmdStatus: MigrateActionStatus = input.qmdAvailable ? "pending" : "skipped";
+	const collectionActions: MigrateAction[] = [];
+	for (const collection of manifest.collections) {
+		if (collection.action === "create") {
+			if (input.qmdAvailable && typeof collections[collection.name] !== "string") continue;
+			collectionActions.push({
+				kind: "removeCollection",
+				name: collection.name,
+				path: typeof collections[collection.name] === "string" ? collections[collection.name] : null,
+				status: qmdStatus,
+			});
+			continue;
+		}
+		// repoint: drop the scoped collection and restore the legacy one at the root.
+		if (typeof collections[collection.name] === "string") {
+			collectionActions.push({
+				kind: "removeCollection",
+				name: collection.name,
+				path: collections[collection.name],
+				status: qmdStatus,
+			});
+		}
+		collectionActions.push({
+			kind: "addCollection",
+			name: collection.name,
+			path: root,
+			manifestAction: "repoint",
+			status: qmdStatus,
+		});
+		const manifestPaths = manifest.contexts
+			.filter((context) => context.collection === collection.name)
+			.map((context) => context.path);
+		const subPaths =
+			manifestPaths.length > 0
+				? manifestPaths.map((manifestPath) => (manifestPath === "/" ? "" : manifestPath.replace(/^\//, "")))
+				: QMD_CONTEXT_SPECS.map(([subPath]) => subPath);
+		for (const subPath of subPaths) {
+			collectionActions.push({ kind: "addContext", collection: collection.name, subPath, status: qmdStatus });
+		}
+	}
+	if (collectionActions.length > 0) {
+		actions.push(...collectionActions, { kind: "updateIndex", status: qmdStatus });
+	}
+
+	const hasMoveWork = actions.some((action) => action.kind === "move");
+	const alreadyMigrated = !hasMoveWork && collectionActions.length === 0;
+	return buildMigratePlan("undo", input, memoryScopePresent, actions, alreadyMigrated);
+}
+
+export function readMigrationManifest(root: string): MigrationManifest | null {
+	const raw = readFileSafe(path.join(root, ".migration-manifest.json"));
+	if (raw === null) return null;
+	try {
+		const parsed = JSON.parse(raw);
+		if (
+			!parsed ||
+			parsed.version !== 1 ||
+			!Array.isArray(parsed.moves) ||
+			!Array.isArray(parsed.collections) ||
+			!Array.isArray(parsed.contexts)
+		) {
+			return null;
+		}
+		return parsed as MigrationManifest;
+	} catch {
+		return null;
+	}
+}
+
+function writeMigrationManifest(root: string, plan: MigratePlan) {
+	// Merge with an earlier partial run: a re-run that only completes the qmd
+	// steps must not drop the moves the first run recorded, or --undo could
+	// never move the files back.
+	const previous = readMigrationManifest(root);
+	const moves = [...(previous?.moves ?? [])];
+	for (const action of plan.actions) {
+		if (action.kind !== "move" || action.conflict || action.status !== "done") continue;
+		if (moves.some((move) => move.from === action.from)) continue;
+		moves.push({ from: action.from, to: action.to });
+	}
+	const collections = [...(previous?.collections ?? [])];
+	for (const action of plan.actions) {
+		if (action.kind !== "addCollection" || action.status !== "done") continue;
+		const entry = { name: action.name, action: action.manifestAction, path: action.path };
+		const index = collections.findIndex((collection) => collection.name === action.name);
+		if (index === -1) collections.push(entry);
+		else collections[index] = entry;
+	}
+	const contexts = [...(previous?.contexts ?? [])];
+	for (const action of plan.actions) {
+		if (action.kind !== "addContext" || action.status !== "done") continue;
+		const contextPath = action.subPath === "" ? "/" : `/${action.subPath}`;
+		if (contexts.some((context) => context.collection === action.collection && context.path === contextPath))
+			continue;
+		contexts.push({ collection: action.collection, path: contextPath });
+	}
+	const manifest: MigrationManifest = {
+		version: 1,
+		timestamp: new Date().toISOString(),
+		moves,
+		collections,
+		contexts,
+	};
+	fs.writeFileSync(path.join(root, ".migration-manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, "utf-8");
+}
+
+function copyTreeSync(from: string, to: string) {
+	const stat = fs.statSync(from);
+	if (stat.isDirectory()) {
+		fs.mkdirSync(to, { recursive: true });
+		for (const entry of fs.readdirSync(from)) copyTreeSync(path.join(from, entry), path.join(to, entry));
+		return;
+	}
+	fs.copyFileSync(from, to);
+}
+
+function verifyTreeSync(from: string, to: string) {
+	const source = inspectTree(from);
+	const copy = inspectTree(to);
+	if (source.files !== copy.files || source.bytes !== copy.bytes) {
+		throw new Error(
+			`copy verification failed for ${from}: expected ${source.files} files/${source.bytes} bytes, got ${copy.files}/${copy.bytes}`,
+		);
+	}
+}
+
+/**
+ * Rename within the tree; on EXDEV fall back to copy -> verify -> delete.
+ * No backup copy: the manifest makes the moves reversible.
+ */
+export function movePathSync(
+	from: string,
+	to: string,
+	rename: (oldPath: string, newPath: string) => void = (oldPath, newPath) => fs.renameSync(oldPath, newPath),
+): void {
+	try {
+		rename(from, to);
+		return;
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code !== "EXDEV") throw err;
+	}
+	copyTreeSync(from, to);
+	verifyTreeSync(from, to);
+	fs.rmSync(from, { recursive: true, force: true });
+}
+
+interface MigrationOutcome {
+	conflicts: number;
+	failed: number;
+}
+
+function qmdContextDescription(subPath: string): string {
+	const spec = QMD_CONTEXT_SPECS.find(([candidate]) => candidate === subPath);
+	return spec ? spec[1] : "";
+}
+
+async function executeMigratePlan(plan: MigratePlan, root: string): Promise<MigrationOutcome> {
+	let conflicts = 0;
+	let failed = 0;
+
+	// File moves complete before any qmd step touches the index.
+	for (const action of plan.actions) {
+		if (action.kind !== "move") continue;
+		if (action.conflict) {
+			conflicts++;
+			continue;
+		}
+		try {
+			const toAbs = path.join(root, action.to);
+			fs.mkdirSync(path.dirname(toAbs), { recursive: true });
+			movePathSync(path.join(root, action.from), toAbs);
+			action.status = "done";
+		} catch {
+			action.status = "failed";
+			failed++;
+		}
+	}
+
+	if (!plan.qmdAvailable) return { conflicts, failed };
+
+	for (const action of plan.actions) {
+		if (action.kind !== "removeCollection") continue;
+		const ok = await runQmd(["collection", "remove", action.name]);
+		action.status = ok ? "done" : "failed";
+		if (ok) qmdCollectionStatusCache.delete(action.name);
+		else failed++;
+	}
+
+	for (const action of plan.actions) {
+		if (action.kind !== "addCollection") continue;
+		let ok = false;
+		try {
+			fs.mkdirSync(action.path, { recursive: true });
+			ok = await runQmd(["collection", "add", action.path, "--name", action.name]);
+		} catch {
+			ok = false;
+		}
+		action.status = ok ? "done" : "failed";
+		if (ok) qmdCollectionStatusCache.set(action.name, { checkedAt: Date.now(), exists: true, path: action.path });
+		else failed++;
+	}
+
+	for (const action of plan.actions) {
+		if (action.kind !== "addContext") continue;
+		const ok = await runQmd([
+			"context",
+			"add",
+			`qmd://${action.collection}/${action.subPath}`,
+			qmdContextDescription(action.subPath),
+		]);
+		action.status = ok ? "done" : "failed";
+		if (!ok) failed++;
+	}
+
+	for (const action of plan.actions) {
+		if (action.kind !== "updateIndex") continue;
+		const ok = await runQmd(["update"], 30_000);
+		action.status = ok ? "done" : "failed";
+		if (!ok) failed++;
+	}
+
+	return { conflicts, failed };
+}
+
+function displayMigratePath(root: string, target: string): string {
+	const base = path.basename(root);
+	const relative = path.relative(root, target);
+	if (!relative) return base;
+	return `${base}/${relative.split(path.sep).join("/")}`;
+}
+
+function formatFileSize(bytes: number): string {
+	if (bytes < 1024) return `${bytes} B`;
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+	return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function migrateStatusSuffix(plan: MigratePlan, action: MigrateAction, applied: boolean): string {
+	if (action.kind === "keep") return "";
+	if (action.status === "failed") return "  (failed)";
+	if (action.status === "skipped") {
+		return plan.qmdAvailable ? "  (skipped)" : "  (skipped: qmd not available)";
+	}
+	return applied ? "  (done)" : "";
+}
+
+/** Print the plan in the chapter 7.4 format: one line per action, then a summary. */
+export function formatMigratePlan(plan: MigratePlan, opts: { applied?: boolean } = {}): string {
+	const applied = opts.applied === true;
+	const lines: string[] = ["plan:"];
+	for (let i = 0; i < plan.actions.length; i++) {
+		const action = plan.actions[i];
+		switch (action.kind) {
+			case "move": {
+				const from = action.dir ? `${action.from}/` : action.from;
+				const to = action.dir ? `${action.to}/` : action.to;
+				const detail = action.dir ? `${action.files} files` : formatFileSize(action.bytes);
+				const suffix = action.conflict
+					? "  (conflict: exists at both ends; skipped)"
+					: migrateStatusSuffix(plan, action, applied);
+				lines.push(`  move    ${from.padEnd(20)} -> ${to.padEnd(28)} (${detail})${suffix}`);
+				break;
+			}
+			case "keep":
+				lines.push(`  keep    ${action.entry}  (unrecognised, left in place)`);
+				break;
+			case "removeCollection": {
+				const where = action.path ? `${displayMigratePath(plan.memoryRoot, action.path)}/` : "an unknown path";
+				lines.push(
+					`  remove  collection ${action.name}  (points at ${where})${migrateStatusSuffix(plan, action, applied)}`,
+				);
+				break;
+			}
+			case "addCollection": {
+				const target = displayMigratePath(plan.memoryRoot, action.path);
+				const shown = action.name === GLOBAL_COLLECTION_NAME ? `${target}/` : target;
+				lines.push(`  add     collection ${action.name}  -> ${shown}${migrateStatusSuffix(plan, action, applied)}`);
+				break;
+			}
+			case "addContext": {
+				const collection = action.collection;
+				const paths: string[] = [];
+				let suffix = "";
+				let index = i;
+				while (index < plan.actions.length) {
+					const next = plan.actions[index];
+					if (!next || next.kind !== "addContext" || next.collection !== collection) break;
+					paths.push(`${collection}/${next.subPath}`);
+					const nextSuffix = migrateStatusSuffix(plan, next, applied);
+					if (nextSuffix) suffix = nextSuffix;
+					index++;
+				}
+				i = index - 1;
+				lines.push(`  context ${paths.join(", ")}${suffix}`);
+				break;
+			}
+			case "updateIndex":
+				lines.push(`  update  qmd index${migrateStatusSuffix(plan, action, applied)}`);
+				break;
+		}
+	}
+	const changes = applied ? plan.actions.filter((action) => action.status === "done").length : 0;
+	lines.push(
+		`summary: ${plan.fileOperations} file operations, ${plan.collectionOperations} collection operations, ${changes} changes made`,
+	);
+	return lines.join("\n");
+}
+
+const MIGRATE_USAGE = [
+	"usage: /memory migrate [--apply] [--undo]",
+	"  (no flags)       print the migration plan",
+	"  --apply          execute the plan",
+	"  --undo           plan the reverse of a completed migration",
+	"  --undo --apply   execute the undo",
+].join("\n");
+
+function parseMigrateArgs(args: string[]): { apply: boolean; undo: boolean; error?: string } {
+	let apply = false;
+	let undo = false;
+	for (const arg of args) {
+		if (arg === "--apply") apply = true;
+		else if (arg === "--undo") undo = true;
+		else return { apply, undo, error: `unknown option: ${arg}` };
+	}
+	return { apply, undo };
+}
+
+async function readMigrationCollections(root: string): Promise<Record<string, string>> {
+	const names = [GLOBAL_COLLECTION_NAME, ...scanProjectScopes(root).map((scope) => path.basename(scope.dir))];
+	const found: Record<string, string> = {};
+	for (const name of names) {
+		const info = await inspectCollection(name);
+		if (info.exists && info.path) found[name] = info.path;
+	}
+	return found;
+}
+
+function migrationNotes(plan: MigratePlan, outcome: MigrationOutcome, undo: boolean): string {
+	const notes: string[] = [];
+	if (outcome.conflicts > 0) notes.push(`conflicts: ${outcome.conflicts} (skipped; resolve and re-run)`);
+	if (outcome.failed > 0) notes.push(`failed: ${outcome.failed} (the migration is re-runnable)`);
+	if (!plan.qmdAvailable) {
+		notes.push("qmd: not available — collection steps skipped; the next session start creates them.");
+	} else if (plan.actions.some((action) => action.kind === "removeCollection" && action.status === "done")) {
+		notes.push("qmd: old vectors are now orphaned; run `qmd cleanup` to reclaim them.");
+	}
+	if (undo) notes.push("undo: the legacy layout is restored.");
+	return notes.join("\n");
+}
+
+/**
+ * Entry point for `/memory migrate` (ticket #16 wires the command):
+ * plan by default, `--apply` executes, `--undo` plans the reverse.
+ */
+export async function runMemoryMigrate(args: string[]): Promise<{ text: string; code: 0 | 1 | 2 }> {
+	const parsed = parseMigrateArgs(args);
+	if (parsed.error) return { text: `${parsed.error}\n${MIGRATE_USAGE}`, code: 2 };
+
+	const root = memoryRoot;
+	const extensionsDir = resolveExtensionsDir();
+	const memoryScopePath = path.join(extensionsDir, "memory-scope.ts");
+	if (fs.existsSync(memoryScopePath)) {
+		return {
+			text: [
+				`refusing to migrate: ${memoryScopePath} still exists.`,
+				"It re-points the pi-memory collection at the current project directory at module load, which would immediately undo the migration.",
+				"Rename that file, then run /reload.",
+			].join("\n"),
+			code: 2,
+		};
+	}
+
+	let manifest: MigrationManifest | null = null;
+	if (parsed.undo) {
+		manifest = readMigrationManifest(root);
+		if (!manifest) {
+			return {
+				text: `no migration manifest at ${path.join(root, ".migration-manifest.json")}; nothing to undo.`,
+				code: 1,
+			};
+		}
+	}
+
+	const qmdAvailable = await detectQmd();
+	const input: MigratePlanInput = {
+		memoryRoot: root,
+		extensionsDir,
+		qmdAvailable,
+		collections: qmdAvailable ? await readMigrationCollections(root) : {},
+	};
+	const plan = parsed.undo ? planMemoryUndo(input, manifest as MigrationManifest) : planMemoryMigration(input);
+
+	if (plan.alreadyMigrated) {
+		return { text: parsed.undo ? "nothing to undo" : "already migrated: nothing to do", code: 0 };
+	}
+	if (!parsed.apply) {
+		return { text: formatMigratePlan(plan), code: plan.conflicts > 0 ? 1 : 0 };
+	}
+
+	const outcome = await executeMigratePlan(plan, root);
+	if (parsed.undo) {
+		// Keep the manifest when qmd could not restore the collections: a later
+		// `--undo --apply` retries just the qmd steps.
+		const qmdStepsSkipped = plan.actions.some(
+			(action) =>
+				(action.kind === "removeCollection" || action.kind === "addCollection" || action.kind === "addContext") &&
+				action.status === "skipped",
+		);
+		if (outcome.conflicts === 0 && outcome.failed === 0 && !qmdStepsSkipped) {
+			try {
+				fs.rmSync(path.join(root, ".migration-manifest.json"), { force: true });
+			} catch {
+				// The undo itself succeeded; a stale manifest is only metadata.
+			}
+		}
+	} else {
+		writeMigrationManifest(root, plan);
+	}
+
+	const note = migrationNotes(plan, outcome, parsed.undo);
+	const text = note
+		? `${formatMigratePlan(plan, { applied: true })}\n${note}`
+		: formatMigratePlan(plan, { applied: true });
+	return { text, code: outcome.conflicts > 0 || outcome.failed > 0 ? 1 : 0 };
+}
+
 export default function (pi: ExtensionAPI) {
 	// --- session_start: detect qmd, auto-setup collection ---
 	pi.on("session_start", async (_event, ctx) => {

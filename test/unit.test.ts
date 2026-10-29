@@ -24,6 +24,7 @@ import {
 	_resetQmdJsResolutionForTest,
 	_setBaseDir,
 	_setExecFileForTest,
+	_setExtensionsDirForTest,
 	_setMemoryRoot,
 	_setQmdAvailable,
 	_setScopeSetForTest,
@@ -49,6 +50,7 @@ import {
 	isExitSummaryEnabled,
 	listKnownScopes,
 	loadProjectConfig,
+	movePathSync,
 	nowTimestamp,
 	parseQmdCollectionList,
 	parseQmdCollectionShow,
@@ -57,6 +59,7 @@ import {
 	parseScopeId,
 	parseScopesEnv,
 	parseScratchpad,
+	planMemoryMigration,
 	probeEmbeddings,
 	projectRootFor,
 	projectScopeId,
@@ -70,6 +73,7 @@ import {
 	resolveScopeReference,
 	resolveScopeSet,
 	resolveWritableScope,
+	runMemoryMigrate,
 	runQmdSearch,
 	type ScopeContext,
 	type ScratchpadItem,
@@ -3792,5 +3796,314 @@ describe("memory_status scopes", () => {
 		expect(text).toContain(`- project:other: ${otherDir()} — exists ✓, collection \`other-aaaa1111\`: —`);
 		expect(text).not.toContain("#aaaa1111");
 		expect(result.details.scopes.map((scope: any) => scope.id)).toEqual(["project:chezmoi", "project:other"]);
+	});
+});
+
+// ==========================================================================
+// 17. Migration: /memory migrate plan/apply/undo (spec chapter 7)
+// ==========================================================================
+
+describe("memory migration", () => {
+	let root: string;
+	let extDir: string;
+	let sim: ReturnType<typeof mockQmdRegistry>;
+
+	beforeEach(() => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-migrate-"));
+		extDir = path.join(root, "ext");
+		fs.mkdirSync(path.join(root, "daily"), { recursive: true });
+		fs.writeFileSync(path.join(root, "MEMORY.md"), "global memory\n", "utf-8");
+		fs.writeFileSync(path.join(root, "SCRATCHPAD.md"), "todos\n", "utf-8");
+		fs.writeFileSync(path.join(root, "daily", "2026-01-01.md"), "log\n", "utf-8");
+		fs.mkdirSync(path.join(root, "recovery"), { recursive: true });
+		fs.mkdirSync(path.join(root, "projects", "gkd-cc779eb9"), { recursive: true });
+		fs.writeFileSync(path.join(root, "notes.txt"), "unrecognised\n", "utf-8");
+		_setMemoryRoot(root);
+		_setExtensionsDirForTest(extDir);
+		_clearQmdStatusCaches();
+		_setQmdAvailable(true);
+		sim = mockQmdRegistry({ "pi-memory": path.resolve(root) });
+	});
+
+	afterEach(() => {
+		_setExtensionsDirForTest(null);
+		_resetExecFileForTest();
+		_resetBaseDir();
+		_setQmdAvailable(false);
+		_clearQmdStatusCaches();
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	test("plans a legacy layout as plain data without touching disk", () => {
+		const plan = planMemoryMigration({
+			memoryRoot: root,
+			extensionsDir: extDir,
+			qmdAvailable: true,
+			collections: { "pi-memory": root },
+		});
+
+		const moves = plan.actions.filter((a) => a.kind === "move").map((a: any) => [a.from, a.to]);
+		expect(moves).toEqual([
+			["MEMORY.md", "global/MEMORY.md"],
+			["SCRATCHPAD.md", "global/SCRATCHPAD.md"],
+			["daily", "global/daily"],
+			["recovery", "global/recovery"],
+		]);
+		expect(plan.actions.filter((a) => a.kind === "keep").map((a: any) => a.entry)).toEqual(["notes.txt"]);
+		expect(
+			plan.actions.filter((a) => a.kind === "addCollection").map((a: any) => [a.name, a.manifestAction]),
+		).toEqual([
+			["pi-memory", "repoint"],
+			["gkd-cc779eb9", "create"],
+		]);
+		expect(plan.fileOperations).toBe(5);
+		expect(plan.collectionOperations).toBe(3);
+		expect(plan.conflicts).toBe(0);
+		expect(plan.alreadyMigrated).toBe(false);
+		expect(fs.existsSync(path.join(root, "global"))).toBe(false);
+		expect(fs.existsSync(path.join(root, "MEMORY.md"))).toBe(true);
+	});
+
+	test("prints the plan in the chapter 7 format and changes nothing", async () => {
+		const result = await runMemoryMigrate([]);
+
+		expect(result.code).toBe(0);
+		expect(result.text).toContain("plan:");
+		expect(result.text).toContain("move    MEMORY.md");
+		expect(result.text).toContain("-> global/MEMORY.md");
+		expect(result.text).toContain("move    daily/");
+		expect(result.text).toContain("-> global/recovery/");
+		expect(result.text).toContain("keep    notes.txt  (unrecognised, left in place)");
+		expect(result.text).toContain("remove  collection pi-memory  (points at pi-memory-migrate-");
+		expect(result.text).toContain("add     collection pi-memory  -> pi-memory-migrate-");
+		expect(result.text).toContain("add     collection gkd-cc779eb9  -> pi-memory-migrate-");
+		expect(result.text).toContain("context pi-memory/daily, pi-memory/");
+		expect(result.text).toContain("context gkd-cc779eb9/daily, gkd-cc779eb9/");
+		expect(result.text).toContain("update  qmd index");
+		expect(result.text).toContain("summary: 5 file operations, 3 collection operations, 0 changes made");
+
+		expect(fs.existsSync(path.join(root, "MEMORY.md"))).toBe(true);
+		expect(fs.existsSync(path.join(root, "global"))).toBe(false);
+		expect(sim.calls.every((args) => args[0] === "collection" && args[1] === "show")).toBe(true);
+	});
+
+	test("--apply moves the files, re-points qmd, and writes the manifest", async () => {
+		const result = await runMemoryMigrate(["--apply"]);
+
+		expect(result.code).toBe(0);
+		expect(fs.readFileSync(path.join(root, "global", "MEMORY.md"), "utf-8")).toBe("global memory\n");
+		expect(fs.readFileSync(path.join(root, "global", "daily", "2026-01-01.md"), "utf-8")).toBe("log\n");
+		expect(fs.existsSync(path.join(root, "MEMORY.md"))).toBe(false);
+		expect(fs.existsSync(path.join(root, "daily"))).toBe(false);
+		expect(fs.existsSync(path.join(root, "recovery"))).toBe(false);
+		expect(fs.existsSync(path.join(root, "global", "recovery"))).toBe(true);
+		expect(fs.readFileSync(path.join(root, "notes.txt"), "utf-8")).toBe("unrecognised\n");
+
+		const manifest = JSON.parse(fs.readFileSync(path.join(root, ".migration-manifest.json"), "utf-8"));
+		expect(manifest.version).toBe(1);
+		expect(manifest.timestamp).toBeTruthy();
+		expect(manifest.moves).toEqual(
+			expect.arrayContaining([
+				{ from: "MEMORY.md", to: "global/MEMORY.md" },
+				{ from: "daily", to: "global/daily" },
+			]),
+		);
+		expect(manifest.collections).toEqual(
+			expect.arrayContaining([
+				{ name: "pi-memory", action: "repoint", path: path.resolve(path.join(root, "global")) },
+				{
+					name: "gkd-cc779eb9",
+					action: "create",
+					path: path.resolve(path.join(root, "projects", "gkd-cc779eb9")),
+				},
+			]),
+		);
+		expect(manifest.contexts).toEqual(
+			expect.arrayContaining([
+				{ collection: "pi-memory", path: "/daily" },
+				{ collection: "pi-memory", path: "/" },
+			]),
+		);
+
+		expect(sim.calls).toContainEqual(["collection", "remove", "pi-memory"]);
+		expect(sim.calls).toContainEqual(["collection", "add", path.join(root, "global"), "--name", "pi-memory"]);
+		expect(sim.calls).toContainEqual(["update"]);
+		expect(sim.collections.get("pi-memory")).toBe(path.resolve(path.join(root, "global")));
+		expect(sim.collections.get("gkd-cc779eb9")).toBe(path.resolve(path.join(root, "projects", "gkd-cc779eb9")));
+		expect(sim.calls.some((args) => args[0] === "cleanup")).toBe(false);
+	});
+
+	test("re-running after a successful apply is a no-op", async () => {
+		await runMemoryMigrate(["--apply"]);
+		const callsBefore = sim.calls.length;
+
+		const again = await runMemoryMigrate(["--apply"]);
+		expect(again.code).toBe(0);
+		expect(again.text).toBe("already migrated: nothing to do");
+		expect(sim.calls.length).toBe(callsBefore);
+	});
+
+	test("reports a conflict, skips that entry, and still runs everything else", async () => {
+		fs.mkdirSync(path.join(root, "global"), { recursive: true });
+		fs.writeFileSync(path.join(root, "global", "MEMORY.md"), "existing\n", "utf-8");
+
+		const result = await runMemoryMigrate(["--apply"]);
+
+		expect(result.code).toBe(1);
+		expect(result.text).toContain("conflict");
+		expect(result.text).toContain("MEMORY.md");
+		expect(fs.readFileSync(path.join(root, "MEMORY.md"), "utf-8")).toBe("global memory\n");
+		expect(fs.readFileSync(path.join(root, "global", "MEMORY.md"), "utf-8")).toBe("existing\n");
+		expect(fs.existsSync(path.join(root, "global", "SCRATCHPAD.md"))).toBe(true);
+		expect(fs.existsSync(path.join(root, "global", "daily", "2026-01-01.md"))).toBe(true);
+		expect(sim.collections.get("pi-memory")).toBe(path.resolve(path.join(root, "global")));
+
+		const manifest = JSON.parse(fs.readFileSync(path.join(root, ".migration-manifest.json"), "utf-8"));
+		expect(manifest.moves.some((move: any) => move.from === "MEMORY.md")).toBe(false);
+	});
+
+	test("missing qmd still moves the files and reports the qmd steps skipped", async () => {
+		_setQmdAvailable(false);
+		_clearQmdStatusCaches();
+		_setQmdAvailable(false);
+
+		const result = await runMemoryMigrate(["--apply"]);
+
+		expect(result.code).toBe(0);
+		expect(fs.readFileSync(path.join(root, "global", "MEMORY.md"), "utf-8")).toBe("global memory\n");
+		expect(fs.existsSync(path.join(root, "MEMORY.md"))).toBe(false);
+		expect(result.text).toContain("skipped");
+		expect(result.text.toLowerCase()).toContain("qmd");
+		expect(sim.calls).toEqual([]);
+	});
+
+	test("refuses with exit 2 when the memory-scope extension is still installed", async () => {
+		const extensions = path.join(root, "extensions");
+		fs.mkdirSync(extensions, { recursive: true });
+		fs.writeFileSync(path.join(extensions, "memory-scope.ts"), "// legacy extension\n", "utf-8");
+		_setExtensionsDirForTest(extensions);
+
+		const result = await runMemoryMigrate(["--apply"]);
+
+		expect(result.code).toBe(2);
+		expect(result.text).toContain("memory-scope.ts");
+		expect(result.text).toContain("/reload");
+		expect(fs.existsSync(path.join(root, "MEMORY.md"))).toBe(true);
+		expect(fs.existsSync(path.join(root, "global"))).toBe(false);
+		expect(sim.calls).toEqual([]);
+	});
+
+	test("--undo --apply restores the legacy layout and the legacy collection", async () => {
+		await runMemoryMigrate(["--apply"]);
+
+		const planned = await runMemoryMigrate(["--undo"]);
+		expect(planned.code).toBe(0);
+		expect(planned.text).toContain("move    global/MEMORY.md");
+		expect(planned.text).toContain("remove  collection gkd-cc779eb9");
+		expect(fs.existsSync(path.join(root, "MEMORY.md"))).toBe(false);
+
+		const result = await runMemoryMigrate(["--undo", "--apply"]);
+		expect(result.code).toBe(0);
+		expect(fs.readFileSync(path.join(root, "MEMORY.md"), "utf-8")).toBe("global memory\n");
+		expect(fs.readFileSync(path.join(root, "daily", "2026-01-01.md"), "utf-8")).toBe("log\n");
+		expect(fs.existsSync(path.join(root, "global", "MEMORY.md"))).toBe(false);
+		expect(sim.collections.has("gkd-cc779eb9")).toBe(false);
+		expect(sim.collections.get("pi-memory")).toBe(path.resolve(root));
+		expect(fs.existsSync(path.join(root, ".migration-manifest.json"))).toBe(false);
+	});
+
+	test("--undo without a manifest fails with a clear error", async () => {
+		const result = await runMemoryMigrate(["--undo", "--apply"]);
+		expect(result.code).not.toBe(0);
+		expect(result.text.toLowerCase()).toContain("manifest");
+	});
+
+	test("undo without qmd keeps the manifest for a later qmd retry", async () => {
+		await runMemoryMigrate(["--apply"]);
+		_setQmdAvailable(false);
+		_clearQmdStatusCaches();
+		_setQmdAvailable(false);
+
+		const result = await runMemoryMigrate(["--undo", "--apply"]);
+
+		expect(result.code).toBe(0);
+		expect(fs.existsSync(path.join(root, "MEMORY.md"))).toBe(true);
+		expect(fs.existsSync(path.join(root, ".migration-manifest.json"))).toBe(true);
+	});
+
+	test("a qmd-less apply completed later with qmd keeps the earlier moves undoable", async () => {
+		_setQmdAvailable(false);
+		_clearQmdStatusCaches();
+		_setQmdAvailable(false);
+		await runMemoryMigrate(["--apply"]);
+
+		_setQmdAvailable(true);
+		_clearQmdStatusCaches();
+		_setQmdAvailable(true);
+		const completed = await runMemoryMigrate(["--apply"]);
+		expect(completed.code).toBe(0);
+
+		const manifest = JSON.parse(fs.readFileSync(path.join(root, ".migration-manifest.json"), "utf-8"));
+		expect(manifest.moves).toEqual(
+			expect.arrayContaining([
+				{ from: "MEMORY.md", to: "global/MEMORY.md" },
+				{ from: "daily", to: "global/daily" },
+			]),
+		);
+		expect(manifest.collections.some((collection: any) => collection.name === "pi-memory")).toBe(true);
+
+		const undo = await runMemoryMigrate(["--undo", "--apply"]);
+		expect(undo.code).toBe(0);
+		expect(fs.readFileSync(path.join(root, "MEMORY.md"), "utf-8")).toBe("global memory\n");
+		expect(fs.existsSync(path.join(root, ".migration-manifest.json"))).toBe(false);
+	});
+
+	test("unknown flags print usage and exit 2", async () => {
+		const result = await runMemoryMigrate(["--force"]);
+		expect(result.code).toBe(2);
+		expect(result.text).toContain("unknown option: --force");
+		expect(result.text).toContain("usage:");
+	});
+
+	test("movePathSync falls back to copy, verify, and delete on EXDEV", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-exdev-"));
+		try {
+			fs.mkdirSync(path.join(dir, "daily"));
+			fs.writeFileSync(path.join(dir, "daily", "2026-01-01.md"), "log\n", "utf-8");
+			const target = path.join(dir, "global", "daily");
+			fs.mkdirSync(path.dirname(target), { recursive: true });
+
+			const exdev = Object.assign(new Error("cross-device link not permitted"), { code: "EXDEV" });
+			let renameCalls = 0;
+			movePathSync(path.join(dir, "daily"), target, () => {
+				renameCalls++;
+				throw exdev;
+			});
+
+			expect(renameCalls).toBe(1);
+			expect(fs.readFileSync(path.join(target, "2026-01-01.md"), "utf-8")).toBe("log\n");
+			expect(fs.existsSync(path.join(dir, "daily"))).toBe(false);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("movePathSync propagates non-EXDEV rename failures and keeps the source", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-exdev-"));
+		try {
+			fs.writeFileSync(path.join(dir, "MEMORY.md"), "memory\n", "utf-8");
+			const target = path.join(dir, "global", "MEMORY.md");
+			const denied = Object.assign(new Error("permission denied"), { code: "EACCES" });
+
+			expect(() =>
+				movePathSync(path.join(dir, "MEMORY.md"), target, () => {
+					throw denied;
+				}),
+			).toThrow();
+			expect(fs.existsSync(path.join(dir, "MEMORY.md"))).toBe(true);
+			expect(fs.existsSync(target)).toBe(false);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
