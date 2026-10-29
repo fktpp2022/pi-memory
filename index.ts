@@ -5,7 +5,10 @@
  * Core memory tools (write/read/scratchpad) work without qmd installed.
  * The memory_search tool requires qmd for keyword, semantic, and hybrid search.
  *
- * Layout (under ~/.pi/agent/memory/):
+ * Layout (memory root, normally ~/.pi/agent/memory):
+ *   global/                — the global scope
+ *   projects/<slug>-<hash>/ — one directory per project scope
+ * Each scope directory holds:
  *   MEMORY.md              — curated long-term memory (decisions, preferences, durable facts)
  *   SCRATCHPAD.md           — checklist of things to keep in mind / fix later
  *   daily/YYYY-MM-DD.md    — daily append-only log (today + yesterday loaded at session start)
@@ -61,20 +64,73 @@ let MEMORY_DIR = resolveMemoryDir();
 let MEMORY_FILE = path.join(MEMORY_DIR, "MEMORY.md");
 let SCRATCHPAD_FILE = path.join(MEMORY_DIR, "SCRATCHPAD.md");
 let DAILY_DIR = path.join(MEMORY_DIR, "daily");
-let RECOVERY_DIR = path.join(MEMORY_DIR, "recovery");
 
-/** Override base directory (for testing). */
+// The memory root holds the per-scope directories (global/ and projects/).
+// MEMORY_DIR always points at the session's own scope directory; extra scopes
+// are resolved on demand from the root.
+let memoryRoot = MEMORY_DIR;
+let ownScopeId = "global";
+let ownScopeDirOverride: string | null = null;
+let activeScopeSet: string[] = ["global"];
+
+function defaultOwnScopeDir(): string {
+	const parsed = parseScopeId(ownScopeId);
+	if (parsed && parsed.kind === "global") return path.join(memoryRoot, "global");
+	const info = parsed ? resolveScopeDirectory(memoryRoot, ownScopeId) : null;
+	return info ? info.dir : path.join(memoryRoot, "projects", parsed?.slug ?? "unknown");
+}
+
+function syncOwnScopePaths() {
+	MEMORY_DIR = ownScopeDirOverride ?? defaultOwnScopeDir();
+	MEMORY_FILE = path.join(MEMORY_DIR, "MEMORY.md");
+	SCRATCHPAD_FILE = path.join(MEMORY_DIR, "SCRATCHPAD.md");
+	DAILY_DIR = path.join(MEMORY_DIR, "daily");
+}
+
+function applyOwnScope(scopeId: string, dir: string | null) {
+	ownScopeId = scopeId;
+	ownScopeDirOverride = dir;
+	syncOwnScopePaths();
+}
+
+function applySessionScopeSet(projectRoot: string) {
+	const resolved = resolveScopeSet(projectRoot);
+	const parsed = parseScopeId(resolved.ownScope);
+	const ownDir =
+		parsed && parsed.kind === "project"
+			? path.join(memoryRoot, "projects", scopeDirName(parsed.slug as string, scopeHash(projectRoot)))
+			: path.join(memoryRoot, "global");
+	applyOwnScope(resolved.ownScope, ownDir);
+	activeScopeSet = [...resolved.scopes];
+}
+
+/** Override base directory (for testing); this is the own scope's directory. */
 export function _setBaseDir(baseDir: string) {
-	MEMORY_DIR = baseDir;
-	MEMORY_FILE = path.join(baseDir, "MEMORY.md");
-	SCRATCHPAD_FILE = path.join(baseDir, "SCRATCHPAD.md");
-	DAILY_DIR = path.join(baseDir, "daily");
-	RECOVERY_DIR = path.join(baseDir, "recovery");
+	memoryRoot = baseDir;
+	applyOwnScope("global", baseDir);
+	activeScopeSet = ["global"];
 }
 
 /** Reset to default paths (for testing). */
 export function _resetBaseDir() {
-	_setBaseDir(resolveMemoryDir());
+	memoryRoot = resolveMemoryDir();
+	applyOwnScope("global", null);
+	activeScopeSet = ["global"];
+}
+
+/** Point at a memory root (the directory holding global/ and projects/) for testing. */
+export function _setMemoryRoot(root: string) {
+	memoryRoot = root;
+	applyOwnScope(ownScopeId, null);
+	activeScopeSet = [ownScopeId];
+}
+
+/** Set the session scope set for testing. */
+export function _setScopeSetForTest(ownScope: string, extras: string[] = []) {
+	const info = resolveScopeDirectory(memoryRoot, ownScope);
+	if (!info) throw new Error(`unknown scope id "${ownScope}"`);
+	applyOwnScope(info.id, info.dir);
+	activeScopeSet = [info.id, ...extras.filter((id, index) => id !== info.id && extras.indexOf(id) === index)];
 }
 
 // ---------------------------------------------------------------------------
@@ -82,9 +138,13 @@ export function _resetBaseDir() {
 // ---------------------------------------------------------------------------
 
 export function ensureDirs() {
-	fs.mkdirSync(MEMORY_DIR, { recursive: true });
-	fs.mkdirSync(DAILY_DIR, { recursive: true });
-	fs.mkdirSync(RECOVERY_DIR, { recursive: true });
+	ensureScopeDirs(MEMORY_DIR);
+}
+
+function ensureScopeDirs(scopeDir: string) {
+	fs.mkdirSync(scopeDir, { recursive: true });
+	fs.mkdirSync(path.join(scopeDir, "daily"), { recursive: true });
+	fs.mkdirSync(path.join(scopeDir, "recovery"), { recursive: true });
 }
 
 // Daily logs are keyed by the user's LOCAL calendar day. toISOString() is UTC,
@@ -134,11 +194,15 @@ export function isValidDailyDate(date: string): boolean {
 	return parsed.getUTCFullYear() === year && parsed.getUTCMonth() === month - 1 && parsed.getUTCDate() === day;
 }
 
-export function dailyPath(date: string): string {
+export function dailyPathIn(scopeDir: string, date: string): string {
 	if (!isValidDailyDate(date)) {
 		throw new Error(`Invalid daily date: ${date}. Expected YYYY-MM-DD.`);
 	}
-	return path.join(DAILY_DIR, `${date}.md`);
+	return path.join(scopeDir, "daily", `${date}.md`);
+}
+
+export function dailyPath(date: string): string {
+	return dailyPathIn(MEMORY_DIR, date);
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +336,156 @@ export function resolveScopeReference(ref: string, known: readonly string[]): st
 	if (candidates.length === 1) return candidates[0];
 	if (candidates.length === 0) throw unknown();
 	throw new Error(`ambiguous scope id "${ref}"; candidates: ${candidates.join(", ")} (use the #<hash> form)`);
+}
+
+// ---------------------------------------------------------------------------
+// Scope file layout (memory root: global/ + projects/<slug>-<hash>/)
+// ---------------------------------------------------------------------------
+
+export interface ScopeDirInfo {
+	id: string;
+	dir: string;
+	slug?: string;
+	hash?: string;
+}
+
+export interface ScopeContext {
+	memoryRoot: string;
+	ownScope: string;
+	ownDir: string;
+	activeScopes: string[];
+}
+
+const SCOPE_DIR_REGEX = /^(.+)-([0-9a-f]{8})$/;
+
+/** Directory of a fully-qualified id (global or project:<slug>#<hash>). */
+export function scopeDirPath(memoryRoot: string, scopeId: string): string | null {
+	const parsed = parseScopeId(scopeId);
+	if (!parsed) return null;
+	if (parsed.kind === "global") return path.join(memoryRoot, "global");
+	if (!parsed.hash) return null;
+	return path.join(memoryRoot, "projects", scopeDirName(parsed.slug as string, parsed.hash));
+}
+
+export function scanProjectScopes(memoryRoot: string): ScopeDirInfo[] {
+	const projectsDir = path.join(memoryRoot, "projects");
+	let names: string[];
+	try {
+		names = fs
+			.readdirSync(projectsDir, { withFileTypes: true })
+			.filter((entry) => entry.isDirectory())
+			.map((entry) => entry.name)
+			.sort();
+	} catch {
+		return [];
+	}
+	const scopes: ScopeDirInfo[] = [];
+	for (const name of names) {
+		const match = SCOPE_DIR_REGEX.exec(name);
+		if (!match) continue;
+		scopes.push({
+			id: projectScopeId(match[1], match[2]),
+			dir: path.join(projectsDir, name),
+			slug: match[1],
+			hash: match[2],
+		});
+	}
+	return scopes;
+}
+
+/**
+ * Known ids are hash-qualified (diagnostics may carry the hash); the display
+ * form is derived from the directory when results are grouped. `global` is
+ * always addressable, even before its directory exists.
+ */
+export function listKnownScopes(memoryRoot: string): string[] {
+	const ids = ["global"];
+	for (const scope of scanProjectScopes(memoryRoot)) {
+		const id = `${scope.id}#${scope.hash}`;
+		if (!ids.includes(id)) ids.push(id);
+	}
+	return ids;
+}
+
+export function resolveScopeDirectory(memoryRoot: string, scopeId: string): ScopeDirInfo | null {
+	const parsed = parseScopeId(scopeId);
+	if (!parsed) return null;
+	if (parsed.kind === "global") return { id: "global", dir: path.join(memoryRoot, "global") };
+	const matches = scanProjectScopes(memoryRoot).filter(
+		(scope) => scope.slug === parsed.slug && (!parsed.hash || scope.hash === parsed.hash),
+	);
+	if (matches.length === 0) return null;
+	if (matches.length > 1) {
+		const candidates = matches.map((scope) => `${scope.id}#${scope.hash}`).join(", ");
+		throw new Error(`ambiguous scope id "${scopeId}"; candidates: ${candidates} (use the #<hash> form)`);
+	}
+	return { id: matches[0].id, dir: matches[0].dir };
+}
+
+function scopeContext(): ScopeContext {
+	return {
+		memoryRoot,
+		ownScope: ownScopeId,
+		ownDir: MEMORY_DIR,
+		activeScopes: [...activeScopeSet],
+	};
+}
+
+function scopeInfoForId(id: string, ctx: ScopeContext): ScopeDirInfo | null {
+	if (id === ctx.ownScope) return { id: ctx.ownScope, dir: ctx.ownDir };
+	return resolveScopeDirectory(ctx.memoryRoot, id);
+}
+
+/** Writes target the own scope or `global`; everything else is rejected. */
+export function resolveWritableScope(scope: string | undefined, ctx: ScopeContext): ScopeDirInfo {
+	const own: ScopeDirInfo = { id: ctx.ownScope, dir: ctx.ownDir };
+	if (!scope || scope === ctx.ownScope) return own;
+	if (scope === "global") {
+		return ctx.ownScope === "global" ? own : { id: "global", dir: path.join(ctx.memoryRoot, "global") };
+	}
+	throw new Error(`scope '${scope}' is not writable; writes target your own scope or global`);
+}
+
+/**
+ * Resolve the scopes a read targets: the active set by default (scopes absent
+ * on disk are skipped), or an explicit list, which may widen beyond the set
+ * but must name existing scopes.
+ */
+export function resolveReadScopes(scopes: string[] | undefined, ctx: ScopeContext): ScopeDirInfo[] {
+	const resolved: ScopeDirInfo[] = [];
+	const add = (info: ScopeDirInfo | null) => {
+		if (info && !resolved.some((scope) => scope.dir === info.dir)) resolved.push(info);
+	};
+
+	if (scopes === undefined) {
+		for (const id of ctx.activeScopes) add(scopeInfoForId(id, ctx));
+		return resolved;
+	}
+
+	const known = listKnownScopes(ctx.memoryRoot);
+	const active = ctx.activeScopes.join(", ");
+	for (const ref of scopes) {
+		if (ref === ctx.ownScope || (ref === "global" && ctx.ownScope === "global")) {
+			add(scopeInfoForId(ctx.ownScope, ctx));
+			continue;
+		}
+		let knownId: string;
+		try {
+			knownId = resolveScopeReference(ref, known);
+		} catch (err) {
+			throw new Error(`${err instanceof Error ? err.message : String(err)} (active: ${active})`);
+		}
+		const info = resolveScopeDirectory(ctx.memoryRoot, knownId);
+		if (!info) {
+			throw new Error(`unknown scope id "${ref}"; known scopes: ${known.join(", ")} (active: ${active})`);
+		}
+		add(info);
+	}
+	return resolved;
+}
+
+export function formatScopedSections(sections: Array<{ scope: string; body: string }>): string {
+	return sections.map((section) => `## Scope: ${section.scope}\n\n${section.body}`).join("\n\n---\n\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -762,6 +976,7 @@ interface RecoveryRecord {
 	version: 1;
 	id: string;
 	createdAt: string;
+	scope?: string;
 	target: MemoryTarget;
 	date?: string;
 	removedContent: string[];
@@ -876,9 +1091,9 @@ export function forgetBlocks(content: string, match: string): { content: string;
 	};
 }
 
-function recoveryPath(recoveryId: string): string | null {
+function recoveryPath(scopeDir: string, recoveryId: string): string | null {
 	if (!RECOVERY_ID_REGEX.test(recoveryId)) return null;
-	return path.join(RECOVERY_DIR, `${recoveryId}.json`);
+	return path.join(scopeDir, "recovery", `${recoveryId}.json`);
 }
 
 function isRecoveryRecord(value: unknown): value is RecoveryRecord {
@@ -896,33 +1111,51 @@ function isRecoveryRecord(value: unknown): value is RecoveryRecord {
 	);
 }
 
-function writeRecoveryRecord(target: MemoryTarget, date: string | undefined, removedContent: string[]): RecoveryRecord {
+function writeRecoveryRecord(
+	scopeDir: string,
+	scopeId: string,
+	target: MemoryTarget,
+	date: string | undefined,
+	removedContent: string[],
+): RecoveryRecord {
 	const record: RecoveryRecord = {
 		version: 1,
 		id: randomUUID(),
 		createdAt: new Date().toISOString(),
+		scope: scopeId,
 		target,
 		...(date ? { date } : {}),
 		removedContent,
 	};
-	const filePath = recoveryPath(record.id);
+	const filePath = recoveryPath(scopeDir, record.id);
 	if (!filePath) throw new Error("Failed to create a valid recovery ID.");
 	fs.writeFileSync(filePath, `${JSON.stringify(record, null, 2)}\n`, { encoding: "utf-8", flag: "wx" });
 	return record;
 }
 
-function readRecoveryRecord(recoveryId: string): { record: RecoveryRecord; filePath: string } | null {
-	const filePath = recoveryPath(recoveryId);
-	if (!filePath) return null;
-	const content = readFileSafe(filePath);
-	if (!content) return null;
-	try {
-		const record: unknown = JSON.parse(content);
-		if (!isRecoveryRecord(record) || record.id !== recoveryId) return null;
-		return { record, filePath };
-	} catch {
-		return null;
+// The recovery id identifies the record, and the record identifies its scope,
+// so a restore does not need a scope parameter. Scan own, global, then every
+// project scope directory.
+function recoverySearchDirs(): string[] {
+	const dirs = [MEMORY_DIR, path.join(memoryRoot, "global"), ...scanProjectScopes(memoryRoot).map((s) => s.dir)];
+	return dirs.filter((dir, index) => dirs.indexOf(dir) === index);
+}
+
+function readRecoveryRecord(recoveryId: string): { record: RecoveryRecord; filePath: string; scopeDir: string } | null {
+	for (const scopeDir of recoverySearchDirs()) {
+		const filePath = recoveryPath(scopeDir, recoveryId);
+		if (!filePath) return null;
+		const content = readFileSafe(filePath);
+		if (!content) continue;
+		try {
+			const record: unknown = JSON.parse(content);
+			if (!isRecoveryRecord(record) || record.id !== recoveryId) continue;
+			return { record, filePath, scopeDir };
+		} catch {
+			// keep scanning other scopes
+		}
 	}
+	return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1592,10 +1825,69 @@ export function _resetMemorySnapshot() {
 // Extension entry point
 // ---------------------------------------------------------------------------
 
+type MemoryReadTarget = "long_term" | "scratchpad" | "daily" | "list";
+
+interface ScopeReadResult {
+	text: string;
+	details: Record<string, unknown>;
+	isError?: boolean;
+}
+
+function readMemoryTarget(scopeDir: string, target: MemoryReadTarget, date?: string): ScopeReadResult {
+	if (target === "list") {
+		try {
+			const files = fs
+				.readdirSync(path.join(scopeDir, "daily"))
+				.filter((f) => f.endsWith(".md"))
+				.sort()
+				.reverse();
+			if (files.length === 0) return { text: "No daily logs found.", details: {} };
+			return { text: `Daily logs:\n${files.map((f) => `- ${f}`).join("\n")}`, details: { files } };
+		} catch {
+			return { text: "No daily logs directory.", details: {} };
+		}
+	}
+
+	if (target === "daily") {
+		const d = date ?? todayStr();
+		if (!isValidDailyDate(d)) {
+			return { text: `Invalid date format: ${d}. Use YYYY-MM-DD.`, details: { date: d }, isError: true };
+		}
+		const filePath = dailyPathIn(scopeDir, d);
+		const content = readFileSafe(filePath);
+		if (!content) return { text: `No daily log for ${d}.`, details: {} };
+		return { text: content, details: { path: filePath, date: d } };
+	}
+
+	if (target === "scratchpad") {
+		const filePath = path.join(scopeDir, "SCRATCHPAD.md");
+		const content = readFileSafe(filePath);
+		if (!content?.trim()) return { text: "SCRATCHPAD.md is empty or does not exist.", details: {} };
+		return { text: content, details: { path: filePath } };
+	}
+
+	const filePath = path.join(scopeDir, "MEMORY.md");
+	const content = readFileSafe(filePath);
+	if (!content) return { text: "MEMORY.md is empty or does not exist.", details: {} };
+	return { text: content, details: { path: filePath } };
+}
+
+function toolError(err: unknown) {
+	return {
+		content: [{ type: "text" as const, text: err instanceof Error ? err.message : String(err) }],
+		isError: true,
+		details: {},
+	};
+}
+
 export default function (pi: ExtensionAPI) {
 	// --- session_start: detect qmd, auto-setup collection ---
 	pi.on("session_start", async (_event, ctx) => {
 		exitSummaryReason = null;
+		// Scope identity is path-bound and resolution happens here, from the
+		// session's cwd — never from process.cwd() (the launch dir).
+		const cwd = typeof ctx.cwd === "string" ? ctx.cwd.trim() : "";
+		if (cwd) applySessionScopeSet(cwd);
 		if (terminalInputUnsubscribe) {
 			terminalInputUnsubscribe();
 			terminalInputUnsubscribe = null;
@@ -1824,6 +2116,7 @@ export default function (pi: ExtensionAPI) {
 			"- 'long_term': Write to MEMORY.md (curated durable facts, decisions, preferences). Mode: 'append' or 'overwrite'.",
 			"- 'daily': Append to today's daily log (daily/<YYYY-MM-DD>.md). Always appends.",
 			"Use this when the user asks you to remember something, or when you learn important preferences/decisions.",
+			"Writes target your own project scope by default; 'global' is the only other writable scope.",
 			"Use #tags (e.g. #decision, #preference, #lesson, #bug) and [[links]] (e.g. [[auth-strategy]]) in content to improve searchability.",
 		].join("\n"),
 		parameters: Type.Object({
@@ -1836,15 +2129,22 @@ export default function (pi: ExtensionAPI) {
 					description: "Write mode for long_term target. Default: 'append'. Daily always appends.",
 				}),
 			),
+			scope: Type.Optional(Type.String({ description: "Scope to write: your own scope (default) or 'global'" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			ensureDirs();
 			const { target, content, mode } = params;
+			let scope: ScopeDirInfo;
+			try {
+				scope = resolveWritableScope(params.scope, scopeContext());
+			} catch (err) {
+				return toolError(err);
+			}
+			ensureScopeDirs(scope.dir);
 			const sid = shortSessionId(ctx.sessionManager.getSessionId());
 			const ts = nowTimestamp();
 
 			if (target === "daily") {
-				const filePath = dailyPath(todayStr());
+				const filePath = dailyPathIn(scope.dir, todayStr());
 				const existing = readFileSafe(filePath) ?? "";
 				const existingPreview = buildPreview(existing, {
 					maxLines: RESPONSE_PREVIEW_MAX_LINES,
@@ -1880,7 +2180,8 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// long_term
-			const existing = readFileSafe(MEMORY_FILE) ?? "";
+			const memoryFile = path.join(scope.dir, "MEMORY.md");
+			const existing = readFileSafe(memoryFile) ?? "";
 			const existingPreview = buildPreview(existing, {
 				maxLines: RESPONSE_PREVIEW_MAX_LINES,
 				maxChars: RESPONSE_PREVIEW_MAX_CHARS,
@@ -1898,13 +2199,13 @@ export default function (pi: ExtensionAPI) {
 
 			if (mode === "overwrite") {
 				const stamped = `<!-- last updated: ${ts} [${sid}] -->\n${content}`;
-				fs.writeFileSync(MEMORY_FILE, stamped, "utf-8");
+				fs.writeFileSync(memoryFile, stamped, "utf-8");
 				await ensureQmdAvailableForUpdate();
 				scheduleQmdUpdate();
 				return {
 					content: [{ type: "text", text: `Overwrote MEMORY.md${existingSnippet}` }],
 					details: {
-						path: MEMORY_FILE,
+						path: memoryFile,
 						target,
 						mode: "overwrite",
 						sessionId: sid,
@@ -1918,13 +2219,13 @@ export default function (pi: ExtensionAPI) {
 			// append (default)
 			const separator = existing.trim() ? "\n\n" : "";
 			const stamped = `<!-- ${ts} [${sid}] -->\n${content}`;
-			fs.writeFileSync(MEMORY_FILE, existing + separator + stamped, "utf-8");
+			fs.writeFileSync(memoryFile, existing + separator + stamped, "utf-8");
 			await ensureQmdAvailableForUpdate();
 			scheduleQmdUpdate();
 			return {
 				content: [{ type: "text", text: `Appended to MEMORY.md${existingSnippet}` }],
 				details: {
-					path: MEMORY_FILE,
+					path: memoryFile,
 					target,
 					mode: "append",
 					sessionId: sid,
@@ -1947,6 +2248,7 @@ export default function (pi: ExtensionAPI) {
 			"- 'undo': Uncheck a done item back to open. Match by substring.",
 			"- 'clear_done': Remove all checked items from the list.",
 			"- 'list': Show all items.",
+			"The scratchpad belongs to your own project scope by default; 'global' is the only other writable scope.",
 		].join("\n"),
 		parameters: Type.Object({
 			action: StringEnum(["add", "done", "undo", "clear_done", "list"] as const, {
@@ -1957,14 +2259,22 @@ export default function (pi: ExtensionAPI) {
 					description: "Item text for add, or substring to match for done/undo",
 				}),
 			),
+			scope: Type.Optional(Type.String({ description: "Scope to use: your own scope (default) or 'global'" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			ensureDirs();
 			const { action, text } = params;
+			let scope: ScopeDirInfo;
+			try {
+				scope = resolveWritableScope(params.scope, scopeContext());
+			} catch (err) {
+				return toolError(err);
+			}
+			ensureScopeDirs(scope.dir);
+			const scratchpadFile = path.join(scope.dir, "SCRATCHPAD.md");
 			const sid = shortSessionId(ctx.sessionManager.getSessionId());
 			const ts = nowTimestamp();
 
-			const existing = readFileSafe(SCRATCHPAD_FILE) ?? "";
+			const existing = readFileSafe(scratchpadFile) ?? "";
 			const items = parseScratchpad(existing);
 
 			if (action === "list") {
@@ -2008,7 +2318,7 @@ export default function (pi: ExtensionAPI) {
 					maxChars: RESPONSE_PREVIEW_MAX_CHARS,
 					mode: "start",
 				});
-				fs.writeFileSync(SCRATCHPAD_FILE, serialized, "utf-8");
+				fs.writeFileSync(scratchpadFile, serialized, "utf-8");
 				await ensureQmdAvailableForUpdate();
 				scheduleQmdUpdate();
 				return {
@@ -2059,7 +2369,7 @@ export default function (pi: ExtensionAPI) {
 					maxChars: RESPONSE_PREVIEW_MAX_CHARS,
 					mode: "start",
 				});
-				fs.writeFileSync(SCRATCHPAD_FILE, serialized, "utf-8");
+				fs.writeFileSync(scratchpadFile, serialized, "utf-8");
 				await ensureQmdAvailableForUpdate();
 				scheduleQmdUpdate();
 				return {
@@ -2088,7 +2398,7 @@ export default function (pi: ExtensionAPI) {
 					maxChars: RESPONSE_PREVIEW_MAX_CHARS,
 					mode: "start",
 				});
-				fs.writeFileSync(SCRATCHPAD_FILE, serialized, "utf-8");
+				fs.writeFileSync(scratchpadFile, serialized, "utf-8");
 				await ensureQmdAvailableForUpdate();
 				scheduleQmdUpdate();
 				return {
@@ -2124,6 +2434,7 @@ export default function (pi: ExtensionAPI) {
 			"- 'scratchpad': Read SCRATCHPAD.md",
 			"- 'daily': Read a specific day's log (default: today). Pass date as YYYY-MM-DD.",
 			"- 'list': List all daily log files.",
+			"Reads the active scope set by default; pass 'scopes' to widen to another existing scope.",
 		].join("\n"),
 		parameters: Type.Object({
 			target: StringEnum(["long_term", "scratchpad", "daily", "list"] as const, {
@@ -2134,94 +2445,47 @@ export default function (pi: ExtensionAPI) {
 					description: "Date for daily log (YYYY-MM-DD). Default: today.",
 				}),
 			),
+			scopes: Type.Optional(
+				Type.Array(Type.String(), {
+					description: "Scopes to read (display ids). Default: the active scope set.",
+				}),
+			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
 			ensureDirs();
 			const { target, date } = params;
 
-			if (target === "list") {
-				try {
-					const files = fs
-						.readdirSync(DAILY_DIR)
-						.filter((f) => f.endsWith(".md"))
-						.sort()
-						.reverse();
-					if (files.length === 0) {
-						return {
-							content: [{ type: "text", text: "No daily logs found." }],
-							details: {},
-						};
-					}
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Daily logs:\n${files.map((f) => `- ${f}`).join("\n")}`,
-							},
-						],
-						details: { files },
-					};
-				} catch {
-					return {
-						content: [{ type: "text", text: "No daily logs directory." }],
-						details: {},
-					};
-				}
+			let scopes: ScopeDirInfo[];
+			try {
+				scopes = resolveReadScopes(params.scopes, scopeContext());
+			} catch (err) {
+				return toolError(err);
 			}
 
-			if (target === "daily") {
-				const d = date ?? todayStr();
-				if (!isValidDailyDate(d)) {
-					return {
-						content: [{ type: "text", text: `Invalid date format: ${d}. Use YYYY-MM-DD.` }],
-						isError: true,
-						details: { date: d },
-					};
-				}
-				const filePath = dailyPath(d);
-				const content = readFileSafe(filePath);
-				if (!content) {
-					return {
-						content: [{ type: "text", text: `No daily log for ${d}.` }],
-						details: {},
-					};
-				}
+			if (target === "daily" && date !== undefined && !isValidDailyDate(date)) {
 				return {
-					content: [{ type: "text", text: content }],
-					details: { path: filePath, date: d },
+					content: [{ type: "text", text: `Invalid date format: ${date}. Use YYYY-MM-DD.` }],
+					isError: true,
+					details: { date },
 				};
 			}
 
-			if (target === "scratchpad") {
-				const content = readFileSafe(SCRATCHPAD_FILE);
-				if (!content?.trim()) {
-					return {
-						content: [
-							{
-								type: "text",
-								text: "SCRATCHPAD.md is empty or does not exist.",
-							},
-						],
-						details: {},
-					};
-				}
+			if (scopes.length <= 1) {
+				const result = readMemoryTarget(scopes[0]?.dir ?? MEMORY_DIR, target, date);
 				return {
-					content: [{ type: "text", text: content }],
-					details: { path: SCRATCHPAD_FILE },
+					content: [{ type: "text", text: result.text }],
+					...(result.isError ? { isError: true } : {}),
+					details: result.details,
 				};
 			}
 
-			// long_term
-			const content = readFileSafe(MEMORY_FILE);
-			if (!content) {
-				return {
-					content: [{ type: "text", text: "MEMORY.md is empty or does not exist." }],
-					details: {},
-				};
-			}
+			const sections = scopes.map((scope) => ({
+				scope: scope.id,
+				body: readMemoryTarget(scope.dir, target, date).text,
+			}));
 			return {
-				content: [{ type: "text", text: content }],
-				details: { path: MEMORY_FILE },
+				content: [{ type: "text", text: formatScopedSections(sections) }],
+				details: { scopes: scopes.map((scope) => scope.id) },
 			};
 		},
 	});
@@ -2237,6 +2501,7 @@ export default function (pi: ExtensionAPI) {
 			"whose visible recovery ID can be passed to memory_restore if the deletion was wrong.",
 			"Use this when the user corrects a stored fact or a memory is no longer true —",
 			"stale entries keep resurfacing in retrieval and cause confidently wrong answers.",
+			"Deletes from your own project scope by default; 'global' is the only other writable scope.",
 		].join("\n"),
 		parameters: Type.Object({
 			match: Type.String({
@@ -2250,9 +2515,11 @@ export default function (pi: ExtensionAPI) {
 			date: Type.Optional(
 				Type.String({ description: "Daily log date (YYYY-MM-DD) when target='daily'. Default: today." }),
 			),
+			scope: Type.Optional(
+				Type.String({ description: "Scope to delete from: your own scope (default) or 'global'" }),
+			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-			ensureDirs();
 			const target: MemoryTarget = params.target ?? "long_term";
 			if (!params.match.trim()) {
 				return {
@@ -2261,6 +2528,13 @@ export default function (pi: ExtensionAPI) {
 					details: {},
 				};
 			}
+			let scope: ScopeDirInfo;
+			try {
+				scope = resolveWritableScope(params.scope, scopeContext());
+			} catch (err) {
+				return toolError(err);
+			}
+			ensureScopeDirs(scope.dir);
 			let filePath: string;
 			let recoveryDate: string | undefined;
 			if (target === "daily") {
@@ -2272,10 +2546,10 @@ export default function (pi: ExtensionAPI) {
 						details: { date: d },
 					};
 				}
-				filePath = dailyPath(d);
+				filePath = dailyPathIn(scope.dir, d);
 				recoveryDate = d;
 			} else {
-				filePath = MEMORY_FILE;
+				filePath = path.join(scope.dir, "MEMORY.md");
 			}
 
 			const existing = readFileSafe(filePath);
@@ -2296,7 +2570,7 @@ export default function (pi: ExtensionAPI) {
 
 			// Persist the complete recovery payload before mutating the source file.
 			// If either write fails, we never report a successful unrecoverable deletion.
-			const recovery = writeRecoveryRecord(target, recoveryDate, result.removed);
+			const recovery = writeRecoveryRecord(scope.dir, scope.id, target, recoveryDate, result.removed);
 			fs.writeFileSync(filePath, result.content, "utf-8");
 			// Forget is a privacy-sensitive mutation. Refresh the snapshot immediately
 			// so deleted content disappears from authoritative context without being
@@ -2327,7 +2601,7 @@ export default function (pi: ExtensionAPI) {
 					target,
 					removed: result.removed.length,
 					recoveryId: recovery.id,
-					recoveryPath: recoveryPath(recovery.id),
+					recoveryPath: recoveryPath(scope.dir, recovery.id),
 					removedPreview,
 				},
 			};
@@ -2346,7 +2620,6 @@ export default function (pi: ExtensionAPI) {
 			recoveryId: Type.String({ description: "Recovery ID returned by memory_forget" }),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-			ensureDirs();
 			const loaded = readRecoveryRecord(params.recoveryId);
 			if (!loaded) {
 				return {
@@ -2356,7 +2629,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const { record, filePath: recordPath } = loaded;
+			const { record, filePath: recordPath, scopeDir } = loaded;
 			if (record.restoredAt) {
 				return {
 					content: [{ type: "text", text: `Recovery ${record.id} was already restored at ${record.restoredAt}.` }],
@@ -2364,7 +2637,8 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const targetPath = record.target === "daily" ? dailyPath(record.date as string) : MEMORY_FILE;
+			const targetPath =
+				record.target === "daily" ? dailyPathIn(scopeDir, record.date as string) : path.join(scopeDir, "MEMORY.md");
 			const existing = readFileSafe(targetPath) ?? "";
 			const missingEntries = record.removedContent.filter((entry) => !existing.includes(entry));
 			if (missingEntries.length > 0) {
@@ -2420,8 +2694,21 @@ export default function (pi: ExtensionAPI) {
 				}),
 			),
 			limit: Type.Optional(Type.Number({ description: "Max results (default: 5)" })),
+			scopes: Type.Optional(
+				Type.Array(Type.String(), {
+					description: "Scopes to search (display ids). Default: the active scope set.",
+				}),
+			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			let scopes: ScopeDirInfo[];
+			try {
+				scopes = resolveReadScopes(params.scopes, scopeContext());
+			} catch (err) {
+				return toolError(err);
+			}
+			const scopeIds = scopes.map((scope) => scope.id);
+
 			if (!qmdAvailable) {
 				// Re-check on demand in case qmd was installed after session start.
 				qmdAvailable = await detectQmd();
@@ -2436,7 +2723,7 @@ export default function (pi: ExtensionAPI) {
 						},
 					],
 					isError: true,
-					details: {},
+					details: { scopes: scopeIds },
 				};
 			}
 
@@ -2456,7 +2743,7 @@ export default function (pi: ExtensionAPI) {
 						},
 					],
 					isError: true,
-					details: {},
+					details: { scopes: scopeIds },
 				};
 			}
 
@@ -2489,7 +2776,7 @@ export default function (pi: ExtensionAPI) {
 									].join("\n"),
 								},
 							],
-							details: { mode, query: params.query, count: 0, needsEmbed: true, embedStarted },
+							details: { mode, query: params.query, scopes: scopeIds, count: 0, needsEmbed: true, embedStarted },
 						};
 					}
 					return {
@@ -2499,7 +2786,7 @@ export default function (pi: ExtensionAPI) {
 								text: `No results found for "${params.query}" (mode: ${mode}).`,
 							},
 						],
-						details: { mode, query: params.query, count: 0, needsEmbed },
+						details: { mode, query: params.query, scopes: scopeIds, count: 0, needsEmbed },
 					};
 				}
 
@@ -2517,7 +2804,7 @@ export default function (pi: ExtensionAPI) {
 
 				return {
 					content: [{ type: "text", text: formatted }],
-					details: { mode, query: params.query, count: results.length, needsEmbed },
+					details: { mode, query: params.query, scopes: scopeIds, count: results.length, needsEmbed },
 				};
 			} catch (err) {
 				return {
@@ -2528,7 +2815,7 @@ export default function (pi: ExtensionAPI) {
 						},
 					],
 					isError: true,
-					details: {},
+					details: { scopes: scopeIds },
 				};
 			}
 		},
@@ -2560,6 +2847,8 @@ export default function (pi: ExtensionAPI) {
 			const lines: string[] = [
 				"# Memory status",
 				"",
+				`- Scope: ${ownScopeId} (own)`,
+				`- Active scopes: ${activeScopeSet.join(", ")}`,
 				`- Memory dir: ${inv.dir}`,
 				`- MEMORY.md: ${inv.longTermChars} chars`,
 				`- Scratchpad: ${inv.scratchpadOpen} open / ${inv.scratchpadTotal} total`,

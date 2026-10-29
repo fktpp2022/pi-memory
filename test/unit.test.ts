@@ -22,21 +22,26 @@ import {
 	_resetQmdJsResolutionForTest,
 	_setBaseDir,
 	_setExecFileForTest,
+	_setMemoryRoot,
 	_setQmdAvailable,
+	_setScopeSetForTest,
 	buildMemoryContext,
 	buildQmdEnv,
 	buildQmdSpawn,
 	clampSearchLimit,
 	dailyPath,
+	dailyPathIn,
 	ensureDirs,
 	ensureQmdEmbed,
 	forgetBlocks,
+	formatScopedSections,
 	getEmbedProbeTimeoutMs,
 	getExitSummaryReasoningEffort,
 	getExitSummaryTimeoutMs,
 	getQmdSearchTimeoutMs,
 	isExitSummaryEmpty,
 	isExitSummaryEnabled,
+	listKnownScopes,
 	loadProjectConfig,
 	nowTimestamp,
 	// scope resolution
@@ -50,12 +55,18 @@ import {
 	readFileSafe,
 	resolveMemoryDir,
 	resolveQmdJsPath,
+	resolveReadScopes,
+	resolveScopeDirectory,
 	resolveScopeReference,
 	resolveScopeSet,
+	resolveWritableScope,
 	runQmdSearch,
+	type ScopeContext,
 	type ScratchpadItem,
+	scanProjectScopes,
 	scheduleQmdUpdate,
 	scopeDirName,
+	scopeDirPath,
 	scopeHash,
 	scopeSlug,
 	scratchpadAdd,
@@ -2824,5 +2835,358 @@ describe("unknown scope ids", () => {
 	test("a hash-qualified reference resolves to the matching project", () => {
 		const known = ["global", "project:dotfiles#aaaa1111", "project:dotfiles#bbbb2222"];
 		expect(resolveScopeReference("project:dotfiles#bbbb2222", known)).toBe("project:dotfiles#bbbb2222");
+	});
+});
+
+// ==========================================================================
+// 15. Scope file layout (global/ + projects/<slug>-<hash>)
+// ==========================================================================
+
+function setupScopedRoot() {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-root-"));
+	fs.mkdirSync(path.join(root, "global"), { recursive: true });
+	fs.mkdirSync(path.join(root, "projects", "chezmoi-d24458d5"), { recursive: true });
+	fs.mkdirSync(path.join(root, "projects", "other-aaaa1111"), { recursive: true });
+	return root;
+}
+
+describe("scope directories", () => {
+	let root: string;
+
+	beforeEach(() => {
+		root = setupScopedRoot();
+		fs.mkdirSync(path.join(root, "projects", "notes.txt"), { recursive: true });
+	});
+
+	afterEach(() => {
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	test("scopeDirPath maps global and hash-qualified project ids", () => {
+		expect(scopeDirPath(root, "global")).toBe(path.join(root, "global"));
+		expect(scopeDirPath(root, "project:chezmoi#d24458d5")).toBe(path.join(root, "projects", "chezmoi-d24458d5"));
+	});
+
+	test("scopeDirPath refuses a bare project id and malformed ids", () => {
+		expect(scopeDirPath(root, "project:chezmoi")).toBeNull();
+		expect(scopeDirPath(root, "nonsense")).toBeNull();
+	});
+
+	test("scanProjectScopes finds <slug>-<hash> directories only", () => {
+		const scopes = scanProjectScopes(root);
+		expect(scopes.map((scope) => [scope.id, scope.slug, scope.hash])).toEqual([
+			["project:chezmoi", "chezmoi", "d24458d5"],
+			["project:other", "other", "aaaa1111"],
+		]);
+	});
+
+	test("listKnownScopes lists global and hash-qualified project ids", () => {
+		expect(listKnownScopes(root)).toEqual(["global", "project:chezmoi#d24458d5", "project:other#aaaa1111"]);
+	});
+
+	test("resolveScopeDirectory resolves the global scope and a unique bare slug", () => {
+		expect(resolveScopeDirectory(root, "global")).toEqual({ id: "global", dir: path.join(root, "global") });
+		expect(resolveScopeDirectory(root, "project:chezmoi")).toEqual({
+			id: "project:chezmoi",
+			dir: path.join(root, "projects", "chezmoi-d24458d5"),
+		});
+	});
+
+	test("resolveScopeDirectory returns null for an unknown scope and creates nothing", () => {
+		expect(resolveScopeDirectory(root, "project:ghost")).toBeNull();
+		expect(fs.readdirSync(path.join(root, "projects"))).not.toContain("ghost-00000000");
+	});
+
+	test("resolveScopeDirectory rejects an ambiguous bare slug", () => {
+		fs.mkdirSync(path.join(root, "projects", "chezmoi-bbbb2222"), { recursive: true });
+		expect(() => resolveScopeDirectory(root, "project:chezmoi")).toThrow(/ambiguous/);
+	});
+
+	test("dailyPathIn derives a daily file inside a scope directory", () => {
+		const scopeDir = path.join(root, "projects", "chezmoi-d24458d5");
+		expect(dailyPathIn(scopeDir, "2026-01-02")).toBe(path.join(scopeDir, "daily", "2026-01-02.md"));
+		expect(() => dailyPathIn(scopeDir, "nope")).toThrow(/Invalid daily date/);
+	});
+
+	test("formatScopedSections groups bodies under the display id with separators", () => {
+		const text = formatScopedSections([
+			{ scope: "project:chezmoi", body: "A" },
+			{ scope: "global", body: "B" },
+		]);
+		expect(text).toBe("## Scope: project:chezmoi\n\nA\n\n---\n\n## Scope: global\n\nB");
+	});
+});
+
+describe("tool scope resolution", () => {
+	let root: string;
+	let ctx: ScopeContext;
+
+	beforeEach(() => {
+		root = setupScopedRoot();
+		ctx = {
+			memoryRoot: root,
+			ownScope: "project:chezmoi",
+			ownDir: path.join(root, "projects", "chezmoi-d24458d5"),
+			activeScopes: ["project:chezmoi"],
+		};
+	});
+
+	afterEach(() => {
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	test("writes default to the own scope", () => {
+		expect(resolveWritableScope(undefined, ctx)).toEqual({ id: "project:chezmoi", dir: ctx.ownDir });
+		expect(resolveWritableScope("project:chezmoi", ctx).dir).toBe(ctx.ownDir);
+	});
+
+	test("writes to global land in global/", () => {
+		expect(resolveWritableScope("global", ctx)).toEqual({ id: "global", dir: path.join(root, "global") });
+	});
+
+	test("writes to another scope fail with the documented error", () => {
+		const message = "scope 'project:other' is not writable; writes target your own scope or global";
+		expect(() => resolveWritableScope("project:other", ctx)).toThrow(message);
+		expect(() => resolveWritableScope("project:ghost", ctx)).toThrow(message.replace("other", "ghost"));
+	});
+
+	test("reads default to the active set and skip scopes missing on disk", () => {
+		ctx.activeScopes = ["project:chezmoi", "global", "project:ghost"];
+		expect(resolveReadScopes(undefined, ctx).map((scope) => scope.id)).toEqual(["project:chezmoi", "global"]);
+	});
+
+	test("reads widen to an existing out-of-set scope", () => {
+		expect(resolveReadScopes(["project:other"], ctx)).toEqual([
+			{ id: "project:other", dir: path.join(root, "projects", "other-aaaa1111") },
+		]);
+	});
+
+	test("an unknown read scope errors with the known ids and the active set", () => {
+		ctx.activeScopes = ["project:chezmoi", "global"];
+		let message = "";
+		try {
+			resolveReadScopes(["project:nope"], ctx);
+		} catch (err) {
+			message = err instanceof Error ? err.message : String(err);
+		}
+		expect(message).toContain('unknown scope id "project:nope"');
+		expect(message).toContain("known scopes: global, project:chezmoi#d24458d5, project:other#aaaa1111");
+		expect(message).toContain("(active: project:chezmoi, global)");
+	});
+});
+
+describe("scoped memory tools", () => {
+	let root: string;
+	let tools: Record<string, any>;
+
+	const ownDir = () => path.join(root, "projects", "chezmoi-d24458d5");
+	const otherDir = () => path.join(root, "projects", "other-aaaa1111");
+	const globalDir = () => path.join(root, "global");
+
+	beforeEach(() => {
+		root = setupScopedRoot();
+		_setMemoryRoot(root);
+		_setScopeSetForTest("project:chezmoi");
+		_setQmdAvailable(false);
+		const mockPi = createMockPi();
+		tools = mockPi.tools;
+		registerExtension(mockPi.pi as any);
+	});
+
+	afterEach(() => {
+		_resetBaseDir();
+		_setQmdAvailable(false);
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	test("memory_write defaults to the own project scope", async () => {
+		await tools.memory_write.execute("c1", { target: "long_term", content: "Own fact" }, null, null, createMockCtx());
+		expect(fs.readFileSync(path.join(ownDir(), "MEMORY.md"), "utf-8")).toContain("Own fact");
+		expect(fs.existsSync(path.join(globalDir(), "MEMORY.md"))).toBe(false);
+	});
+
+	test("memory_write scope 'global' writes to global/", async () => {
+		const result = await tools.memory_write.execute(
+			"c1",
+			{ target: "long_term", content: "Global fact", scope: "global" },
+			null,
+			null,
+			createMockCtx(),
+		);
+		expect(fs.readFileSync(path.join(globalDir(), "MEMORY.md"), "utf-8")).toContain("Global fact");
+		expect(result.details.path).toBe(path.join(globalDir(), "MEMORY.md"));
+	});
+
+	test("memory_write to another scope is rejected and creates nothing", async () => {
+		const result = await tools.memory_write.execute(
+			"c1",
+			{ target: "long_term", content: "Nope", scope: "project:ghost" },
+			null,
+			null,
+			createMockCtx(),
+		);
+		expect(result.isError).toBe(true);
+		expect(result.content[0].text).toBe(
+			"scope 'project:ghost' is not writable; writes target your own scope or global",
+		);
+		expect(fs.readdirSync(path.join(root, "projects")).sort()).toEqual(["chezmoi-d24458d5", "other-aaaa1111"]);
+	});
+
+	test("scratchpad scope 'global' writes global/SCRATCHPAD.md", async () => {
+		await tools.scratchpad.execute(
+			"c1",
+			{ action: "add", text: "Global todo", scope: "global" },
+			null,
+			null,
+			createMockCtx(),
+		);
+		expect(fs.readFileSync(path.join(globalDir(), "SCRATCHPAD.md"), "utf-8")).toContain("Global todo");
+		expect(fs.existsSync(path.join(ownDir(), "SCRATCHPAD.md"))).toBe(false);
+	});
+
+	test("memory_forget scope 'global' records recovery in global/ and restore finds it", async () => {
+		fs.writeFileSync(
+			path.join(globalDir(), "MEMORY.md"),
+			"<!-- 2026-01-01 00:00:00 [abcdef12] -->\nGlobal fact to forget\n",
+			"utf-8",
+		);
+		const forget = await tools.memory_forget.execute(
+			"c1",
+			{ match: "Global fact", scope: "global" },
+			null,
+			null,
+			createMockCtx(),
+		);
+		expect(forget.details.recoveryId).toBeTruthy();
+		expect(fs.readdirSync(path.join(globalDir(), "recovery"))).toHaveLength(1);
+		expect(fs.readFileSync(path.join(globalDir(), "MEMORY.md"), "utf-8").trim()).toBe("");
+
+		const restore = await tools.memory_restore.execute(
+			"c1",
+			{ recoveryId: forget.details.recoveryId },
+			null,
+			null,
+			createMockCtx(),
+		);
+		expect(restore.content[0].text).toContain("Restored");
+		expect(fs.readFileSync(path.join(globalDir(), "MEMORY.md"), "utf-8")).toContain("Global fact to forget");
+	});
+
+	test("memory_read defaults to the own scope without a group heading", async () => {
+		fs.writeFileSync(path.join(ownDir(), "MEMORY.md"), "Own memories", "utf-8");
+		const result = await tools.memory_read.execute("c1", { target: "long_term" }, null, null, {});
+		expect(result.content[0].text).toBe("Own memories");
+	});
+
+	test("memory_read groups results per scope when several are read", async () => {
+		_setScopeSetForTest("project:chezmoi", ["global"]);
+		fs.writeFileSync(path.join(ownDir(), "MEMORY.md"), "Own memories", "utf-8");
+		fs.writeFileSync(path.join(globalDir(), "MEMORY.md"), "Global memories", "utf-8");
+		const result = await tools.memory_read.execute("c1", { target: "long_term" }, null, null, {});
+		expect(result.content[0].text).toBe(
+			"## Scope: project:chezmoi\n\nOwn memories\n\n---\n\n## Scope: global\n\nGlobal memories",
+		);
+		expect(result.details.scopes).toEqual(["project:chezmoi", "global"]);
+	});
+
+	test("memory_read widens to an existing out-of-set scope", async () => {
+		fs.writeFileSync(path.join(otherDir(), "MEMORY.md"), "Other memories", "utf-8");
+		const result = await tools.memory_read.execute(
+			"c1",
+			{ target: "long_term", scopes: ["project:other"] },
+			null,
+			null,
+			{},
+		);
+		expect(result.content[0].text).toBe("Other memories");
+	});
+
+	test("memory_read rejects an unknown scope and creates no directory", async () => {
+		const result = await tools.memory_read.execute(
+			"c1",
+			{ target: "long_term", scopes: ["project:ghost"] },
+			null,
+			null,
+			{},
+		);
+		expect(result.isError).toBe(true);
+		expect(result.content[0].text).toContain('unknown scope id "project:ghost"');
+		expect(result.content[0].text).toContain("(active: project:chezmoi)");
+		expect(fs.readdirSync(path.join(root, "projects")).sort()).toEqual(["chezmoi-d24458d5", "other-aaaa1111"]);
+	});
+
+	test("memory_search validates explicit scopes before searching", async () => {
+		const result = await tools.memory_search.execute(
+			"c1",
+			{ query: "anything", scopes: ["project:ghost"] },
+			null,
+			null,
+			{},
+		);
+		expect(result.isError).toBe(true);
+		expect(result.content[0].text).toContain('unknown scope id "project:ghost"');
+	});
+
+	test("memory_search accepts the default active set", async () => {
+		const result = await tools.memory_search.execute("c1", { query: "anything" }, null, null, {});
+		expect(result.isError).toBe(true);
+		expect(result.content[0].text).toContain("qmd");
+	});
+});
+
+describe("session_start scope resolution", () => {
+	let root: string;
+	let projectDir: string;
+	let tools: Record<string, any>;
+	let hooks: Record<string, (...args: unknown[]) => unknown>;
+
+	beforeEach(() => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-session-root-"));
+		projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-session-proj-"));
+		_setMemoryRoot(root);
+		_resetMemorySnapshot();
+		_setQmdAvailable(false);
+		const mockPi = createMockPi();
+		tools = mockPi.tools;
+		hooks = mockPi.hooks;
+		registerExtension(mockPi.pi as any);
+	});
+
+	afterEach(() => {
+		delete process.env.PI_MEMORY_SCOPES;
+		_resetBaseDir();
+		_setQmdAvailable(false);
+		fs.rmSync(root, { recursive: true, force: true });
+		fs.rmSync(projectDir, { recursive: true, force: true });
+	});
+
+	const sessionCtx = () => ({
+		cwd: projectDir,
+		hasUI: false,
+		sessionManager: { getSessionId: () => "scope001" },
+		ui: { notify: () => {} },
+	});
+
+	test("resolves the own scope from ctx.cwd", async () => {
+		await hooks.session_start({}, sessionCtx());
+		await tools.memory_write.execute(
+			"c1",
+			{ target: "long_term", content: "Session fact" },
+			null,
+			null,
+			createMockCtx("scope001234567890"),
+		);
+		const dir = path.join(root, "projects", `${scopeSlug(projectDir)}-${scopeHash(projectDir)}`);
+		expect(fs.readFileSync(path.join(dir, "MEMORY.md"), "utf-8")).toContain("Session fact");
+	});
+
+	test("PI_MEMORY_SCOPES extras join the active set", async () => {
+		process.env.PI_MEMORY_SCOPES = "global";
+		fs.mkdirSync(path.join(root, "global"), { recursive: true });
+		fs.writeFileSync(path.join(root, "global", "MEMORY.md"), "Global context", "utf-8");
+		await hooks.session_start({}, sessionCtx());
+		const result = await tools.memory_read.execute("c1", { target: "long_term" }, null, null, {});
+		expect(result.content[0].text).toContain("## Scope: global");
+		expect(result.content[0].text).toContain("Global context");
 	});
 });
