@@ -24,7 +24,7 @@
  */
 
 import { type ExecFileOptions, execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { type Message, StringEnum, Type } from "@earendil-works/pi-ai";
@@ -139,6 +139,139 @@ export function dailyPath(date: string): string {
 		throw new Error(`Invalid daily date: ${date}. Expected YYYY-MM-DD.`);
 	}
 	return path.join(DAILY_DIR, `${date}.md`);
+}
+
+// ---------------------------------------------------------------------------
+// Scope resolution (pure: ids, slug + hash, config/env layers)
+// ---------------------------------------------------------------------------
+
+export interface ParsedScopeId {
+	kind: "global" | "project";
+	id: string;
+	slug?: string;
+	hash?: string;
+}
+
+const SCOPE_ID_REGEX = /^project:([A-Za-z0-9._-]+)(?:#([0-9a-f]{8}))?$/;
+
+export function parseScopeId(id: string): ParsedScopeId | null {
+	if (id === "global") return { kind: "global", id };
+	const match = SCOPE_ID_REGEX.exec(id);
+	if (!match) return null;
+	return { kind: "project", id, slug: match[1], hash: match[2] };
+}
+
+export function scopeSlug(projectRoot: string): string {
+	const basename =
+		projectRoot
+			.replace(/[\\/]+$/, "")
+			.split(/[\\/]/)
+			.pop() ?? "";
+	return basename.replace(/[^A-Za-z0-9._-]+/g, "_");
+}
+
+export function scopeHash(projectRoot: string): string {
+	return createHash("sha1").update(projectRoot.replace(/\\/g, "/").toLowerCase()).digest("hex").slice(0, 8);
+}
+
+// The display form never carries the hash; it exists only in directory and collection names.
+export function projectScopeId(slug: string, _hash?: string): string {
+	return `project:${slug}`;
+}
+
+export function scopeDirName(slug: string, hash: string): string {
+	return `${slug}-${hash}`;
+}
+
+export function deriveOwnScope(projectRoot: string, slugOverride?: string): { slug: string; hash: string; id: string } {
+	const slug = slugOverride ?? scopeSlug(projectRoot);
+	const hash = scopeHash(projectRoot);
+	return { slug, hash, id: projectScopeId(slug, hash) };
+}
+
+export interface ProjectConfig {
+	project?: string;
+	scopes?: string[];
+}
+
+export function loadProjectConfig(projectRoot: string, opts: { trusted?: boolean } = {}): ProjectConfig | null {
+	if (opts.trusted === false) return null;
+	const raw = readFileSafe(path.join(projectRoot, ".pi", "memory.json"));
+	if (raw === null) return null;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		return null;
+	}
+	if (typeof parsed !== "object" || parsed === null) return null;
+	const config = parsed as Record<string, unknown>;
+	const result: ProjectConfig = {};
+	if (typeof config.project === "string") result.project = config.project;
+	if (Array.isArray(config.scopes) && config.scopes.every((s) => typeof s === "string")) {
+		result.scopes = config.scopes as string[];
+	}
+	return result;
+}
+
+export function parseScopesEnv(value: string): string[] {
+	const ids = value
+		.split(",")
+		.map((s) => s.trim())
+		.filter(Boolean);
+	return ids.filter((id, index) => ids.indexOf(id) === index);
+}
+
+export interface ResolvedScopeSet {
+	ownScope: string;
+	extraScopes: string[];
+	scopes: string[];
+	source: "command" | "env" | "config" | "default";
+}
+
+export function resolveScopeSet(
+	projectRoot: string,
+	opts: { commandScopes?: string[]; trusted?: boolean } = {},
+): ResolvedScopeSet {
+	const config = loadProjectConfig(projectRoot, { trusted: opts.trusted });
+	const ownScope = deriveOwnScope(projectRoot, config?.project).id;
+
+	let extraScopes: string[];
+	let source: ResolvedScopeSet["source"];
+	if (opts.commandScopes !== undefined) {
+		extraScopes = opts.commandScopes;
+		source = "command";
+	} else if (process.env.PI_MEMORY_SCOPES !== undefined) {
+		extraScopes = parseScopesEnv(process.env.PI_MEMORY_SCOPES);
+		source = "env";
+	} else if (config?.scopes !== undefined) {
+		extraScopes = config.scopes;
+		source = "config";
+	} else {
+		extraScopes = [];
+		source = "default";
+	}
+
+	const uniqueExtras = extraScopes.filter((id, index) => id !== ownScope && extraScopes.indexOf(id) === index);
+	return { ownScope, extraScopes: uniqueExtras, scopes: [ownScope, ...uniqueExtras], source };
+}
+
+export function resolveScopeReference(ref: string, known: readonly string[]): string {
+	const unknown = () => new Error(`unknown scope id "${ref}"; known scopes: ${known.join(", ")}`);
+	const parsed = parseScopeId(ref);
+	if (!parsed) throw unknown();
+	if (parsed.kind === "global") {
+		if (known.includes("global")) return "global";
+		throw unknown();
+	}
+	if (parsed.hash !== undefined) {
+		if (known.includes(ref)) return ref;
+		throw unknown();
+	}
+	const candidates = known.filter((id) => id === ref || id.startsWith(`${ref}#`));
+	if (candidates.length === 1) return candidates[0];
+	if (candidates.length === 0) throw unknown();
+	throw new Error(`ambiguous scope id "${ref}"; candidates: ${candidates.join(", ")} (use the #<hash> form)`);
 }
 
 // ---------------------------------------------------------------------------
