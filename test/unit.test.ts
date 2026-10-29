@@ -2160,6 +2160,25 @@ describe("extension registration", () => {
 			expect(mockPi.tools[name].description).toBeTruthy();
 		}
 	});
+
+	test("tool descriptions document the scope semantics", () => {
+		const mockPi = createMockPi();
+		registerExtension(mockPi.pi as any);
+		const expectations: Array<[string, string[]]> = [
+			["memory_write", ["`scope` is optional", "own scope or 'global'", "rejected"]],
+			["scratchpad", ["`scope` is optional", "own scope or 'global'"]],
+			["memory_forget", ["`scope` is optional", "own scope or 'global'"]],
+			["memory_read", ["`scopes` is optional", "active scope set", "## Scope:"]],
+			["memory_search", ["`scopes` is optional", "active scope set"]],
+			["memory_restore", ["no scope parameter"]],
+			["memory_status", ["no scope parameter"]],
+		];
+		for (const [name, fragments] of expectations) {
+			for (const fragment of fragments) {
+				expect(mockPi.tools[name].description).toContain(fragment);
+			}
+		}
+	});
 });
 
 // ==========================================================================
@@ -3123,6 +3142,17 @@ describe("scoped memory tools", () => {
 		expect(result.details.scopes).toEqual(["project:chezmoi", "global"]);
 	});
 
+	test("memory_read groups in set order and omits scopes with no content", async () => {
+		_setScopeSetForTest("project:chezmoi", ["project:other", "global"]);
+		fs.writeFileSync(path.join(ownDir(), "MEMORY.md"), "Own memories", "utf-8");
+		fs.writeFileSync(path.join(globalDir(), "MEMORY.md"), "Global memories", "utf-8");
+		const result = await tools.memory_read.execute("c1", { target: "long_term" }, null, null, {});
+		expect(result.content[0].text).toBe(
+			"## Scope: project:chezmoi\n\nOwn memories\n\n---\n\n## Scope: global\n\nGlobal memories",
+		);
+		expect(result.details.scopes).toEqual(["project:chezmoi", "global"]);
+	});
+
 	test("memory_read widens to an existing out-of-set scope", async () => {
 		fs.writeFileSync(path.join(otherDir(), "MEMORY.md"), "Other memories", "utf-8");
 		const result = await tools.memory_read.execute(
@@ -3669,6 +3699,103 @@ describe("memory_status collections", () => {
 		expect(text).toContain("qmd collection remove old-1111aaaa");
 		expect(text).toContain("Orphaned embedding chunks: 66 (81%)");
 		expect(text).toContain("qmd cleanup");
+	});
+
+	test("reports each scope's collection state in the scopes section", async () => {
+		const result = await tools.memory_status.execute("c1", {}, null, null, createMockCtx());
+		const text = result.content[0].text;
+		expect(text).toContain("## Scopes");
+		expect(text).toContain(
+			`- project:chezmoi (own): ${path.join(root, "projects", "chezmoi-d24458d5")} — exists ✓, collection \`chezmoi-d24458d5\`: ✓`,
+		);
+		expect(text).toContain(`- global: ${path.join(root, "global")} — exists ✓, collection \`pi-memory\`: ✓`);
+		expect(result.details.scopes).toEqual([
+			{
+				id: "project:chezmoi",
+				own: true,
+				dir: path.join(root, "projects", "chezmoi-d24458d5"),
+				dirExists: true,
+				collection: "chezmoi-d24458d5",
+				collectionState: "exists",
+			},
+			{
+				id: "global",
+				own: false,
+				dir: path.join(root, "global"),
+				dirExists: true,
+				collection: "pi-memory",
+				collectionState: "exists",
+			},
+		]);
+	});
+});
+
+describe("memory_status scopes", () => {
+	let root: string;
+	let tools: Record<string, any>;
+
+	const ownDir = () => path.join(root, "projects", "chezmoi-d24458d5");
+	const otherDir = () => path.join(root, "projects", "other-aaaa1111");
+	const globalDir = () => path.join(root, "global");
+
+	beforeEach(() => {
+		root = setupScopedRoot();
+		_setMemoryRoot(root);
+		_setScopeSetForTest("project:chezmoi", ["global"]);
+		_clearQmdStatusCaches();
+		_setQmdAvailable(false);
+		const mockPi = createMockPi();
+		tools = mockPi.tools;
+		registerExtension(mockPi.pi as any);
+	});
+
+	afterEach(() => {
+		_resetExecFileForTest();
+		_resetBaseDir();
+		_setQmdAvailable(false);
+		_clearQmdStatusCaches();
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	test("lists every active scope with its directory without needing qmd", async () => {
+		const result = await tools.memory_status.execute("c1", {}, null, null, createMockCtx());
+		const text = result.content[0].text;
+		expect(text).toContain("- Scope: project:chezmoi (own)");
+		expect(text).toContain("- Active scopes: project:chezmoi (own), global");
+		expect(text).toContain("## Scopes");
+		expect(text).toContain(`- project:chezmoi (own): ${ownDir()} — exists ✓, collection \`chezmoi-d24458d5\`: —`);
+		expect(text).toContain(`- global: ${globalDir()} — exists ✓, collection \`pi-memory\`: —`);
+		expect(text.indexOf(`- project:chezmoi (own): ${ownDir()}`)).toBeLessThan(
+			text.indexOf(`- global: ${globalDir()}`),
+		);
+		expect(result.details.scopes).toEqual([
+			{
+				id: "project:chezmoi",
+				own: true,
+				dir: ownDir(),
+				dirExists: true,
+				collection: "chezmoi-d24458d5",
+				collectionState: "unchecked",
+			},
+			{
+				id: "global",
+				own: false,
+				dir: globalDir(),
+				dirExists: true,
+				collection: "pi-memory",
+				collectionState: "unchecked",
+			},
+		]);
+	});
+
+	test("prints display ids without the hash for hash-qualified active scopes", async () => {
+		_setScopeSetForTest("project:chezmoi", ["project:other#aaaa1111"]);
+		const result = await tools.memory_status.execute("c1", {}, null, null, createMockCtx());
+		const text = result.content[0].text;
+		expect(text).toContain("- Active scopes: project:chezmoi (own), project:other");
+		expect(text).toContain(`- project:other: ${otherDir()} — exists ✓, collection \`other-aaaa1111\`: —`);
+		expect(text).not.toContain("#aaaa1111");
+		expect(result.details.scopes.map((scope: any) => scope.id)).toEqual(["project:chezmoi", "project:other"]);
 	});
 });
 
