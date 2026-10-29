@@ -1192,76 +1192,174 @@ function readRecoveryRecord(recoveryId: string): { record: RecoveryRecord; fileP
 // Context builder
 // ---------------------------------------------------------------------------
 
-export function buildMemoryContext(searchResults?: string): string {
-	ensureDirs();
-	// Priority order: scratchpad > today's daily > search results > MEMORY.md > yesterday's daily
-	const sections: string[] = [];
+interface ScopeContentSection {
+	label: string;
+	content: string;
+	mode: TruncateMode;
+	maxLines: number;
+	maxChars: number;
+	rendered: string;
+}
 
-	const scratchpad = readFileSafe(SCRATCHPAD_FILE);
+/** The literal display form of a scope id (no hash), as tool parameters accept it. */
+function displayScopeId(id: string): string {
+	const parsed = parseScopeId(id);
+	if (!parsed) return id;
+	return parsed.kind === "global" ? "global" : projectScopeId(parsed.slug as string, parsed.hash);
+}
+
+/** Active scope directories, own scope first, de-duplicated by directory. */
+function activeScopeDirs(): Array<{ id: string; dir: string }> {
+	const ctx = scopeContext();
+	const ordered = [ownScopeId, ...activeScopeSet.filter((id) => id !== ownScopeId)];
+	const entries: Array<{ id: string; dir: string }> = [];
+	for (const id of ordered) {
+		const info = scopeInfoForId(id, ctx);
+		if (!info) continue;
+		if (entries.some((entry) => entry.dir === info.dir)) continue;
+		entries.push({ id: displayScopeId(id), dir: info.dir });
+	}
+	return entries;
+}
+
+function buildScopeSection(
+	label: string,
+	content: string,
+	mode: TruncateMode,
+	maxLines: number,
+	maxChars: number,
+): ScopeContentSection | null {
+	const rendered = formatContextSection(label, content, mode, maxLines, maxChars);
+	if (!rendered) return null;
+	return { label, content, mode, maxLines, maxChars, rendered };
+}
+
+/** One scope's files in injected order: scratchpad > today > long-term > yesterday. */
+function collectScopeSections(dir: string): ScopeContentSection[] {
+	const sections: ScopeContentSection[] = [];
+	const push = (section: ScopeContentSection | null) => {
+		if (section) sections.push(section);
+	};
+
+	const scratchpad = readFileSafe(path.join(dir, "SCRATCHPAD.md"));
 	if (scratchpad?.trim()) {
-		const openItems = parseScratchpad(scratchpad).filter((i) => !i.done);
+		const openItems = parseScratchpad(scratchpad).filter((item) => !item.done);
 		if (openItems.length > 0) {
-			const serialized = serializeScratchpad(openItems);
-			const section = formatContextSection(
-				"## SCRATCHPAD.md (working context)",
-				serialized,
-				"start",
-				CONTEXT_SCRATCHPAD_MAX_LINES,
-				CONTEXT_SCRATCHPAD_MAX_CHARS,
+			push(
+				buildScopeSection(
+					"### SCRATCHPAD.md (working context)",
+					serializeScratchpad(openItems),
+					"start",
+					CONTEXT_SCRATCHPAD_MAX_LINES,
+					CONTEXT_SCRATCHPAD_MAX_CHARS,
+				),
 			);
-			if (section) sections.push(section);
 		}
 	}
 
 	const today = todayStr();
-	const yesterday = yesterdayStr();
-
-	const todayContent = readFileSafe(dailyPath(today));
-	if (todayContent?.trim()) {
-		const section = formatContextSection(
-			`## Daily log: ${today} (today)`,
-			todayContent,
+	push(
+		buildScopeSection(
+			`### Daily log: ${today} (today)`,
+			readFileSafe(dailyPathIn(dir, today)) ?? "",
 			"end",
 			CONTEXT_DAILY_MAX_LINES,
 			CONTEXT_DAILY_MAX_CHARS,
-		);
-		if (section) sections.push(section);
-	}
+		),
+	);
 
-	if (searchResults?.trim()) {
-		const section = formatContextSection(
-			"## Relevant memories (auto-retrieved)",
-			searchResults,
-			"start",
-			CONTEXT_SEARCH_MAX_LINES,
-			CONTEXT_SEARCH_MAX_CHARS,
-		);
-		if (section) sections.push(section);
-	}
-
-	const longTerm = readFileSafe(MEMORY_FILE);
-	if (longTerm?.trim()) {
-		const section = formatContextSection(
-			"## MEMORY.md (long-term)",
-			longTerm,
+	push(
+		buildScopeSection(
+			"### MEMORY.md (long-term)",
+			readFileSafe(path.join(dir, "MEMORY.md")) ?? "",
 			"middle",
 			CONTEXT_LONG_TERM_MAX_LINES,
 			CONTEXT_LONG_TERM_MAX_CHARS,
-		);
-		if (section) sections.push(section);
-	}
+		),
+	);
 
-	const yesterdayContent = readFileSafe(dailyPath(yesterday));
-	if (yesterdayContent?.trim()) {
-		const section = formatContextSection(
-			`## Daily log: ${yesterday} (yesterday)`,
-			yesterdayContent,
+	const yesterday = yesterdayStr();
+	push(
+		buildScopeSection(
+			`### Daily log: ${yesterday} (yesterday)`,
+			readFileSafe(dailyPathIn(dir, yesterday)) ?? "",
 			"end",
 			CONTEXT_DAILY_MAX_LINES,
 			CONTEXT_DAILY_MAX_CHARS,
-		);
-		if (section) sections.push(section);
+		),
+	);
+
+	return sections;
+}
+
+/** Shrink a section's content to fit a char budget, keeping its heading. */
+function shrinkSectionTo(section: ScopeContentSection, budget: number): string {
+	const contentBudget = budget - section.label.length - 2;
+	if (contentBudget <= 0) return "";
+	const result = buildPreview(section.content, {
+		maxLines: Number.POSITIVE_INFINITY,
+		maxChars: contentBudget,
+		mode: section.mode,
+	});
+	if (!result.preview) return "";
+	return `${section.label}\n\n${result.preview}`;
+}
+
+/**
+ * Render one `## Scope: <id>` block within its share of the budget. Sections
+ * are dropped from the lowest-priority end (yesterday, long-term, today) until
+ * the block fits; the working context is truncated last, so no scope vanishes.
+ */
+function renderScopeBlock(id: string, dir: string, share: number): string {
+	const sections = collectScopeSections(dir);
+	if (sections.length === 0) return "";
+
+	const join = (items: ScopeContentSection[]) => items.map((item) => item.rendered).join("\n\n");
+	const totalChars = join(sections).length;
+	let kept = sections;
+	let body = join(kept);
+	let truncated = false;
+
+	while (body.length > share && kept.length > 1) {
+		kept = kept.slice(0, -1);
+		body = join(kept);
+		truncated = true;
 	}
+	if (body.length > share && kept.length === 1) {
+		const shrunk = shrinkSectionTo(kept[0], share);
+		if (shrunk) {
+			kept = [{ ...kept[0], rendered: shrunk }];
+			body = shrunk;
+			truncated = true;
+		}
+	}
+
+	const marker = truncated ? `\n\n[truncated: showing ${body.length}/${totalChars} chars of scope ${id}]` : "";
+	return `## Scope: ${id}\n\n${body}${marker}`;
+}
+
+export function buildMemoryContext(searchResults?: string): string {
+	ensureDirs();
+
+	const searchSection = searchResults?.trim()
+		? formatContextSection(
+				"## Relevant memories (auto-retrieved)",
+				searchResults,
+				"start",
+				CONTEXT_SEARCH_MAX_LINES,
+				CONTEXT_SEARCH_MAX_CHARS,
+			)
+		: "";
+
+	// The search section keeps its cap; the remainder is split equally among the
+	// scopes, and an absent search section redistributes its share. A scope with
+	// no content still reserves its share: no scope is ever dropped.
+	const scopes = activeScopeDirs();
+	const searchReserve = searchSection ? CONTEXT_SEARCH_MAX_CHARS : 0;
+	const scopeShare = scopes.length > 0 ? Math.floor((CONTEXT_MAX_CHARS - searchReserve) / scopes.length) : 0;
+
+	const blocks = scopes.map((scope) => renderScopeBlock(scope.id, scope.dir, scopeShare)).filter(Boolean);
+	const sections = [...blocks, searchSection].filter(Boolean);
 
 	if (sections.length === 0) {
 		return "";
@@ -1773,7 +1871,23 @@ async function runQmdUpdateNow() {
 	// embed; not chained here so shutdown stays fast.
 }
 
-/** Search for memories relevant to the user's prompt. Returns formatted markdown or empty string on error. */
+const RELEVANT_MEMORIES_LIMIT = 3;
+
+function formatSearchHit(result: QmdSearchResult, scopeId: string): string {
+	const text = getQmdResultText(result);
+	if (!text.trim()) return "";
+	const filePath = getQmdResultPath(result);
+	const filePart = filePath ? `_${filePath}_\n` : "";
+	return `[${scopeId}] ${filePart}${text.trim()}`;
+}
+
+/**
+ * Search every active scope separately and merge round-robin in set order.
+ * A single union search applies its limit globally after the merge, so one
+ * noisy scope could take every slot; round-robin guarantees each scope's best
+ * hit lands as long as there are slots. Returns formatted markdown, or an
+ * empty string on error.
+ */
 export async function searchRelevantMemories(prompt: string): Promise<string> {
 	if (!qmdAvailable || !prompt.trim()) return "";
 
@@ -1787,30 +1901,49 @@ export async function searchRelevantMemories(prompt: string): Promise<string> {
 
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
-		const hasCollection = await checkCollection("pi-memory");
-		if (!hasCollection) return "";
+		// Only scopes whose directory exists and whose collection is usable can
+		// be searched; ensureScopeCollection also creates a missing collection.
+		const searchable: Array<{ id: string; collection: string }> = [];
+		for (const scope of activeScopeDirs()) {
+			if (!fs.existsSync(scope.dir)) continue;
+			const state = await ensureScopeCollection({ id: scope.id, dir: scope.dir });
+			if (state !== "ready" && state !== "created" && state !== "repointed") continue;
+			const collection = collectionNameForScope(scope.id, scope.dir);
+			if (collection) searchable.push({ id: scope.id, collection });
+		}
+		if (searchable.length === 0) return "";
 
 		const results = await Promise.race([
-			runQmdSearch("keyword", sanitized, 3),
+			Promise.all(
+				searchable.map((scope) =>
+					runQmdSearch("keyword", sanitized, RELEVANT_MEMORIES_LIMIT, undefined, scope.collection),
+				),
+			),
 			new Promise<never>((_, reject) => {
 				timer = setTimeout(() => reject(new Error("timeout")), 3_000);
 			}),
 		]);
 
-		if (!results || results.results.length === 0) return "";
+		const perScope = results.map((result, index) =>
+			result.results
+				.map((hit) => formatSearchHit(hit, searchable[index].id))
+				.filter((snippet) => snippet.length > 0),
+		);
 
-		const snippets = results.results
-			.map((r) => {
-				const text = getQmdResultText(r);
-				if (!text.trim()) return null;
-				const filePath = getQmdResultPath(r);
-				const filePart = filePath ? `_${filePath}_` : "";
-				return filePart ? `${filePart}\n${text.trim()}` : text.trim();
-			})
-			.filter(Boolean);
+		const merged: string[] = [];
+		for (let pass = 0; merged.length < RELEVANT_MEMORIES_LIMIT; pass++) {
+			let added = false;
+			for (const hits of perScope) {
+				if (pass >= hits.length) continue;
+				merged.push(hits[pass]);
+				added = true;
+				if (merged.length >= RELEVANT_MEMORIES_LIMIT) break;
+			}
+			if (!added) break;
+		}
 
-		if (snippets.length === 0) return "";
-		return snippets.join("\n\n---\n\n");
+		if (merged.length === 0) return "";
+		return merged.join("\n\n---\n\n");
 	} catch {
 		return "";
 	} finally {
@@ -1877,9 +2010,10 @@ export function runQmdSearch(
 	query: string,
 	limit: number,
 	timeoutOverrideMs?: number,
+	collection: string = GLOBAL_COLLECTION_NAME,
 ): Promise<{ results: QmdSearchResult[]; stderr: string }> {
 	const subcommand = mode === "keyword" ? "search" : mode === "semantic" ? "vsearch" : "query";
-	const args = [subcommand, "--json", "-c", "pi-memory", "-n", String(limit), query];
+	const args = [subcommand, "--json", "-c", collection, "-n", String(limit), query];
 	const timeoutMs = timeoutOverrideMs ?? getQmdSearchTimeoutMs();
 
 	return new Promise((resolve, reject) => {
@@ -2012,6 +2146,43 @@ export function _resetMemorySnapshot() {
 	snapshotTakenOnDate = null;
 	snapshotReason = null;
 	snapshotDirty = false;
+}
+
+/** Inspect snapshot state (for testing). */
+export function _getSnapshotStateForTest(): { reason: string | null; dirty: boolean; snapshot: string | null } {
+	return { reason: snapshotReason, dirty: snapshotDirty, snapshot: memorySnapshot };
+}
+
+/**
+ * Replace the session's extra scopes mid-session (the `/memory scope` path).
+ * Every ref is resolved before any state changes, so an unknown or ambiguous
+ * id leaves the whole set untouched. The own scope stays first; the own scope
+ * can never appear twice. The config file and MEMORY_DIR are not touched.
+ */
+export function applyScopeSetChange(extraScopes: string[]): void {
+	const known = listKnownScopes(memoryRoot);
+	const ownDisplay = displayScopeId(ownScopeId);
+	const resolved: string[] = [];
+	for (const ref of extraScopes) {
+		const id = resolveScopeReference(ref, known);
+		if (id === ownScopeId || displayScopeId(id) === ownDisplay) continue;
+		const dir = scopeDirPath(memoryRoot, id);
+		if (dir && path.resolve(dir) === path.resolve(MEMORY_DIR)) continue;
+		if (!resolved.includes(id)) resolved.push(id);
+	}
+
+	activeScopeSet = [ownScopeId, ...resolved];
+
+	// Fire-and-forget: collections follow the new set lazily; a scope without a
+	// directory is skipped and no directory is ever created here.
+	void ensureActiveScopeCollections().catch(() => {});
+
+	// §5.4: a set change is a deliberate event. Refresh the frozen snapshot
+	// immediately; in refresh mode mark it stale for the next turn; in per-turn
+	// mode the next turn rebuilds from the new set anyway.
+	const mode = getSnapshotMode();
+	if (mode === "stable") refreshMemorySnapshot("scope_change");
+	else if (mode === "refresh") snapshotDirty = true;
 }
 
 // ---------------------------------------------------------------------------

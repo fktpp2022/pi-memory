@@ -17,6 +17,7 @@ import {
 	_clearQmdStatusCaches,
 	_clearUpdateTimer,
 	_getEmbedInFlight,
+	_getSnapshotStateForTest,
 	_getUpdateTimer,
 	_resetBaseDir,
 	_resetExecFileForTest,
@@ -27,6 +28,7 @@ import {
 	_setMemoryRoot,
 	_setQmdAvailable,
 	_setScopeSetForTest,
+	applyScopeSetChange,
 	buildMemoryContext,
 	buildQmdEnv,
 	buildQmdSpawn,
@@ -82,6 +84,7 @@ import {
 	scratchpadAdd,
 	scratchpadClearDone,
 	scratchpadToggle,
+	searchRelevantMemories,
 	serializeScratchpad,
 	shortSessionId,
 	todayStr,
@@ -595,7 +598,8 @@ describe("buildMemoryContext", () => {
 		ensureDirs();
 		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "Important fact", "utf-8");
 		const ctx = buildMemoryContext();
-		expect(ctx).toContain("## MEMORY.md (long-term)");
+		expect(ctx).toContain("## Scope: global");
+		expect(ctx).toContain("### MEMORY.md (long-term)");
 		expect(ctx).toContain("Important fact");
 	});
 
@@ -621,7 +625,7 @@ describe("buildMemoryContext", () => {
 		const today = todayStr();
 		fs.writeFileSync(path.join(tmpDir, "daily", `${today}.md`), "Today's work", "utf-8");
 		const ctx = buildMemoryContext();
-		expect(ctx).toContain(`## Daily log: ${today} (today)`);
+		expect(ctx).toContain(`### Daily log: ${today} (today)`);
 		expect(ctx).toContain("Today's work");
 	});
 
@@ -630,7 +634,7 @@ describe("buildMemoryContext", () => {
 		const yesterday = yesterdayStr();
 		fs.writeFileSync(path.join(tmpDir, "daily", `${yesterday}.md`), "Yesterday's work", "utf-8");
 		const ctx = buildMemoryContext();
-		expect(ctx).toContain(`## Daily log: ${yesterday} (yesterday)`);
+		expect(ctx).toContain(`### Daily log: ${yesterday} (yesterday)`);
 		expect(ctx).toContain("Yesterday's work");
 	});
 
@@ -641,12 +645,13 @@ describe("buildMemoryContext", () => {
 		const today = todayStr();
 		fs.writeFileSync(path.join(tmpDir, "daily", `${today}.md`), "Daily content", "utf-8");
 
-		const ctx = buildMemoryContext();
+		const ctx = buildMemoryContext("Relevant hit");
 		expect(ctx).toStartWith("# Memory");
 		expect(ctx).toContain("---");
 		expect(ctx).toContain("Memory content");
 		expect(ctx).toContain("Task");
 		expect(ctx).toContain("Daily content");
+		expect(ctx).toContain("Relevant hit");
 	});
 
 	test("ignores empty/whitespace-only files", () => {
@@ -3665,5 +3670,415 @@ describe("memory_status collections", () => {
 		expect(text).toContain("qmd collection remove old-1111aaaa");
 		expect(text).toContain("Orphaned embedding chunks: 66 (81%)");
 		expect(text).toContain("qmd cleanup");
+	});
+});
+
+// ==========================================================================
+// 17. Per-scope injected context (spec 5.1 + 5.3)
+// ==========================================================================
+
+describe("per-scope injected context", () => {
+	let root: string;
+
+	const ownDir = () => path.join(root, "projects", "chezmoi-d24458d5");
+	const otherDir = () => path.join(root, "projects", "other-aaaa1111");
+	const globalDir = () => path.join(root, "global");
+
+	function writeScopeFiles(
+		dir: string,
+		files: { scratchpad?: string; today?: string; longTerm?: string; yesterday?: string },
+	) {
+		fs.mkdirSync(path.join(dir, "daily"), { recursive: true });
+		if (files.scratchpad !== undefined) {
+			fs.writeFileSync(path.join(dir, "SCRATCHPAD.md"), files.scratchpad, "utf-8");
+		}
+		if (files.today !== undefined) {
+			fs.writeFileSync(path.join(dir, "daily", `${todayStr()}.md`), files.today, "utf-8");
+		}
+		if (files.longTerm !== undefined) {
+			fs.writeFileSync(path.join(dir, "MEMORY.md"), files.longTerm, "utf-8");
+		}
+		if (files.yesterday !== undefined) {
+			fs.writeFileSync(path.join(dir, "daily", `${yesterdayStr()}.md`), files.yesterday, "utf-8");
+		}
+	}
+
+	const scratchpad = (text: string) => `# Scratchpad\n\n- [ ] ${text}\n`;
+
+	beforeEach(() => {
+		root = setupScopedRoot();
+		_setMemoryRoot(root);
+		_setScopeSetForTest("project:chezmoi");
+		_resetMemorySnapshot();
+	});
+
+	afterEach(() => {
+		_resetBaseDir();
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	test("emits one block per scope: own, then extras, then global when the set lists it last", () => {
+		_setScopeSetForTest("project:chezmoi", ["project:other", "global"]);
+		fs.writeFileSync(path.join(ownDir(), "MEMORY.md"), "OWN_SCOPE_MARKER", "utf-8");
+		fs.writeFileSync(path.join(otherDir(), "MEMORY.md"), "OTHER_SCOPE_MARKER", "utf-8");
+		fs.writeFileSync(path.join(globalDir(), "MEMORY.md"), "GLOBAL_SCOPE_MARKER", "utf-8");
+
+		const ctx = buildMemoryContext();
+		expect(ctx).toStartWith("# Memory");
+		const own = ctx.indexOf("## Scope: project:chezmoi");
+		const other = ctx.indexOf("## Scope: project:other");
+		const global = ctx.indexOf("## Scope: global");
+		expect(own).toBeGreaterThanOrEqual(0);
+		expect(other).toBeGreaterThan(own);
+		expect(global).toBeGreaterThan(other);
+		expect(ctx).toContain("OWN_SCOPE_MARKER");
+		expect(ctx).toContain("OTHER_SCOPE_MARKER");
+		expect(ctx).toContain("GLOBAL_SCOPE_MARKER");
+	});
+
+	test("keeps the declared extra order instead of forcing global last", () => {
+		_setScopeSetForTest("project:chezmoi", ["global", "project:other"]);
+		fs.writeFileSync(path.join(ownDir(), "MEMORY.md"), "OWN", "utf-8");
+		fs.writeFileSync(path.join(globalDir(), "MEMORY.md"), "GLOBAL", "utf-8");
+		fs.writeFileSync(path.join(otherDir(), "MEMORY.md"), "OTHER", "utf-8");
+
+		const ctx = buildMemoryContext();
+		const own = ctx.indexOf("## Scope: project:chezmoi");
+		const global = ctx.indexOf("## Scope: global");
+		const other = ctx.indexOf("## Scope: project:other");
+		expect(own).toBeGreaterThanOrEqual(0);
+		expect(global).toBeGreaterThan(own);
+		expect(other).toBeGreaterThan(global);
+	});
+
+	test("orders a scope's sub-sections scratchpad, today, MEMORY.md, yesterday", () => {
+		writeScopeFiles(ownDir(), {
+			scratchpad: scratchpad("OPEN_ITEM"),
+			today: "TODAY_CONTENT",
+			longTerm: "LONGTERM_CONTENT",
+			yesterday: "YESTERDAY_CONTENT",
+		});
+
+		const ctx = buildMemoryContext();
+		const headings = [
+			"### SCRATCHPAD.md (working context)",
+			`### Daily log: ${todayStr()} (today)`,
+			"### MEMORY.md (long-term)",
+			`### Daily log: ${yesterdayStr()} (yesterday)`,
+		].map((heading) => ctx.indexOf(heading));
+		expect(headings.every((index) => index >= 0)).toBe(true);
+		expect(headings).toEqual([...headings].sort((a, b) => a - b));
+		expect(ctx.split("\n")).not.toContain("## MEMORY.md (long-term)");
+	});
+
+	test("a scope with no content contributes no block and no empty heading", () => {
+		_setScopeSetForTest("project:chezmoi", ["global"]);
+		fs.writeFileSync(path.join(ownDir(), "MEMORY.md"), "OWN_ONLY", "utf-8");
+
+		const ctx = buildMemoryContext();
+		expect(ctx).toContain("## Scope: project:chezmoi");
+		expect(ctx).not.toContain("## Scope: global");
+	});
+
+	test("the shared search section follows every scope block", () => {
+		_setScopeSetForTest("project:chezmoi", ["global"]);
+		fs.writeFileSync(path.join(ownDir(), "MEMORY.md"), "OWN", "utf-8");
+		fs.writeFileSync(path.join(globalDir(), "MEMORY.md"), "GLOBAL", "utf-8");
+
+		const ctx = buildMemoryContext("SEARCH_HIT");
+		expect(ctx.indexOf("## Relevant memories (auto-retrieved)")).toBeGreaterThan(ctx.indexOf("## Scope: global"));
+		expect(ctx).toContain("SEARCH_HIT");
+	});
+
+	test("splits the remaining budget equally and truncates each oversized scope visibly", () => {
+		_setScopeSetForTest("project:chezmoi", ["global"]);
+		const long = "x".repeat(3_000);
+		for (const dir of [ownDir(), globalDir()]) {
+			writeScopeFiles(dir, {
+				scratchpad: scratchpad("s".repeat(1_900)),
+				today: long,
+				longTerm: "m".repeat(3_000),
+			});
+		}
+
+		const ctx = buildMemoryContext("query hit");
+		expect(ctx).toContain("## Scope: project:chezmoi");
+		expect(ctx).toContain("## Scope: global");
+		expect(ctx).toContain("[truncated: showing");
+		expect(ctx).toContain("chars of scope project:chezmoi]");
+		expect(ctx).toContain("chars of scope global]");
+		expect(ctx.length).toBeLessThanOrEqual(16_200);
+		expect(ctx).not.toContain("m".repeat(3_000));
+	});
+
+	test("truncates lowest priority first: yesterday, then MEMORY.md, then today", () => {
+		_setScopeSetForTest("project:chezmoi", ["project:other", "global"]);
+		writeScopeFiles(ownDir(), {
+			scratchpad: scratchpad("s".repeat(1_900)),
+			today: "t".repeat(3_000),
+			longTerm: "m".repeat(4_000),
+			yesterday: "y".repeat(3_000),
+		});
+		fs.writeFileSync(path.join(otherDir(), "MEMORY.md"), "OTHER_SCOPE", "utf-8");
+		fs.writeFileSync(path.join(globalDir(), "MEMORY.md"), "GLOBAL_SCOPE", "utf-8");
+
+		const ctx = buildMemoryContext("query hit");
+		const ownBlock = ctx.slice(ctx.indexOf("## Scope: project:chezmoi"), ctx.indexOf("## Scope: project:other"));
+		expect(ownBlock).toContain("### SCRATCHPAD.md (working context)");
+		expect(ownBlock).not.toContain("### Daily log:");
+		expect(ownBlock).not.toContain("### MEMORY.md (long-term)");
+		expect(ownBlock).toContain("[truncated: showing");
+		// No scope is dropped, even when heavily truncated.
+		expect(ctx).toContain("## Scope: project:other");
+		expect(ctx).toContain("## Scope: global");
+	});
+
+	test("redistributes the unused search share when no search results are present", () => {
+		_setScopeSetForTest("project:chezmoi", ["global"]);
+		for (const dir of [ownDir(), globalDir()]) {
+			writeScopeFiles(dir, {
+				scratchpad: scratchpad("s".repeat(1_900)),
+				today: "t".repeat(3_000),
+				longTerm: "m".repeat(1_900),
+			});
+		}
+
+		const withSearch = buildMemoryContext("query hit");
+		expect(withSearch).toContain("[truncated: showing");
+
+		const withoutSearch = buildMemoryContext("");
+		expect(withoutSearch).not.toContain("[truncated: showing");
+		expect(withoutSearch).toContain("## Scope: project:chezmoi");
+		expect(withoutSearch).toContain("## Scope: global");
+	});
+});
+
+// ==========================================================================
+// 18. Per-scope search + round-robin merge (spec 5.2)
+// ==========================================================================
+
+describe("per-scope search merge", () => {
+	let root: string;
+
+	const ownCollection = "chezmoi-d24458d5";
+
+	function stubQmd(hits: Record<string, QmdHit[]>) {
+		const searchCalls: string[][] = [];
+		_setExecFileForTest(((_file: string, args: string[], _opts: any, cb: any) => {
+			if (args[0] === "collection" && args[1] === "show") {
+				const name = args[2];
+				const dir = name === "pi-memory" ? path.join(root, "global") : path.join(root, "projects", ownCollection);
+				cb(null, `Collection: ${name}\n  Path: ${dir}\n`, "");
+				return;
+			}
+			if (args[0] === "search") {
+				searchCalls.push([...args]);
+				cb(null, JSON.stringify(hits[args[3]] ?? []), "");
+				return;
+			}
+			cb(null, "", "");
+		}) as any);
+		return searchCalls;
+	}
+
+	type QmdHit = { path?: string; content: string };
+
+	beforeEach(() => {
+		root = setupScopedRoot();
+		_setMemoryRoot(root);
+		_setScopeSetForTest("project:chezmoi", ["global"]);
+		_setQmdAvailable(true);
+		_clearQmdStatusCaches();
+	});
+
+	afterEach(() => {
+		_resetExecFileForTest();
+		_resetBaseDir();
+		_clearQmdStatusCaches();
+		_setQmdAvailable(false);
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	test("searches each scope and merges round-robin in set order", async () => {
+		const searchCalls = stubQmd({
+			[ownCollection]: [
+				{ path: "own/1.md", content: "OWN_BEST" },
+				{ content: "OWN_SECOND" },
+				{ content: "OWN_THIRD" },
+			],
+			"pi-memory": [{ content: "GLOBAL_BEST" }],
+		});
+
+		const out = await searchRelevantMemories("lighthouse");
+
+		// One query per scope, with that scope's collection.
+		expect(searchCalls.map((args) => args[3]).sort()).toEqual(["pi-memory", ownCollection].sort());
+		expect(searchCalls.every((args) => args.includes("-n") && args[args.indexOf("-n") + 1] === "3")).toBe(true);
+
+		// The global scope's best hit survives even though the own scope would
+		// have taken every slot in a single union search.
+		expect(out).toContain("[project:chezmoi]");
+		expect(out).toContain("[global]");
+		expect(out).toContain("OWN_BEST");
+		expect(out).toContain("GLOBAL_BEST");
+		expect(out).not.toContain("OWN_THIRD");
+
+		// Pass 1: own best, then global best; pass 2: own second.
+		const ownBest = out.indexOf("OWN_BEST");
+		const globalBest = out.indexOf("GLOBAL_BEST");
+		const ownSecond = out.indexOf("OWN_SECOND");
+		expect(ownBest).toBeGreaterThanOrEqual(0);
+		expect(globalBest).toBeGreaterThan(ownBest);
+		expect(ownSecond).toBeGreaterThan(globalBest);
+	});
+
+	test("skips scopes whose directory does not exist", async () => {
+		fs.rmSync(path.join(root, "global"), { recursive: true, force: true });
+		const searchCalls = stubQmd({ [ownCollection]: [{ content: "OWN_ONLY" }] });
+
+		const out = await searchRelevantMemories("lighthouse");
+		expect(searchCalls.map((args) => args[3])).toEqual([ownCollection]);
+		expect(out).toContain("OWN_ONLY");
+		expect(out).not.toContain("[global]");
+	});
+
+	test("returns an empty string when a scope search fails", async () => {
+		_setExecFileForTest(((_file: string, args: string[], _opts: any, cb: any) => {
+			if (args[0] === "collection" && args[1] === "show") {
+				const dir =
+					args[2] === "pi-memory" ? path.join(root, "global") : path.join(root, "projects", ownCollection);
+				cb(null, `Path: ${dir}\n`, "");
+				return;
+			}
+			cb(new Error("qmd exploded"), "", "");
+		}) as any);
+
+		expect(await searchRelevantMemories("lighthouse")).toBe("");
+	});
+});
+
+// ==========================================================================
+// 19. Scope-set changes invalidate the snapshot (spec 5.4)
+// ==========================================================================
+
+describe("scope-set change snapshot invalidation", () => {
+	let root: string;
+	const prevSnapshotEnv = process.env.PI_MEMORY_SNAPSHOT;
+
+	const stubQmdRegistry = () => {
+		_setExecFileForTest(((_file: string, args: string[], _opts: any, cb: any) => {
+			if (args[0] === "collection" && args[1] === "show") {
+				const name = args[2];
+				const dir =
+					name === "pi-memory" ? path.join(root, "global") : path.join(root, "projects", "chezmoi-d24458d5");
+				cb(null, `Path: ${dir}\n`, "");
+				return;
+			}
+			cb(null, "", "");
+		}) as any);
+	};
+
+	beforeEach(() => {
+		root = setupScopedRoot();
+		_setMemoryRoot(root);
+		_setScopeSetForTest("project:chezmoi");
+		_resetMemorySnapshot();
+		_clearQmdStatusCaches();
+		_setQmdAvailable(true);
+		stubQmdRegistry();
+	});
+
+	afterEach(() => {
+		if (prevSnapshotEnv === undefined) delete process.env.PI_MEMORY_SNAPSHOT;
+		else process.env.PI_MEMORY_SNAPSHOT = prevSnapshotEnv;
+		_resetExecFileForTest();
+		_resetBaseDir();
+		_clearQmdStatusCaches();
+		_setQmdAvailable(false);
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	test("stable mode refreshes the snapshot with reason scope_change", () => {
+		process.env.PI_MEMORY_SNAPSHOT = "stable";
+		fs.writeFileSync(path.join(root, "global", "MEMORY.md"), "GLOBAL_AFTER_CHANGE", "utf-8");
+
+		applyScopeSetChange(["global"]);
+
+		const state = _getSnapshotStateForTest();
+		expect(state.reason).toBe("scope_change");
+		expect(state.dirty).toBe(false);
+		expect(state.snapshot).toContain("## Scope: global");
+		expect(state.snapshot).toContain("GLOBAL_AFTER_CHANGE");
+	});
+
+	test("refresh mode marks the snapshot dirty", () => {
+		process.env.PI_MEMORY_SNAPSHOT = "refresh";
+
+		applyScopeSetChange(["global"]);
+
+		const state = _getSnapshotStateForTest();
+		expect(state.dirty).toBe(true);
+		expect(state.reason).toBeNull();
+	});
+
+	test("per-turn mode leaves the snapshot untouched", () => {
+		process.env.PI_MEMORY_SNAPSHOT = "per-turn";
+
+		applyScopeSetChange(["global"]);
+
+		const state = _getSnapshotStateForTest();
+		expect(state.dirty).toBe(false);
+		expect(state.reason).toBeNull();
+	});
+
+	test("throws on an unknown id without changing the active set", () => {
+		process.env.PI_MEMORY_SNAPSHOT = "stable";
+		fs.writeFileSync(path.join(root, "global", "MEMORY.md"), "GLOBAL_SHOULD_NOT_APPEAR", "utf-8");
+
+		expect(() => applyScopeSetChange(["project:ghost"])).toThrow(/unknown scope id/);
+		expect(buildMemoryContext()).not.toContain("## Scope: global");
+		expect(_getSnapshotStateForTest().reason).toBeNull();
+		expect(fs.readdirSync(path.join(root, "projects")).sort()).toEqual(["chezmoi-d24458d5", "other-aaaa1111"]);
+	});
+
+	test("throws on an ambiguous bare slug without mutating state", () => {
+		process.env.PI_MEMORY_SNAPSHOT = "stable";
+		fs.mkdirSync(path.join(root, "projects", "chezmoi-bbbb2222"), { recursive: true });
+
+		expect(() => applyScopeSetChange(["project:chezmoi"])).toThrow(/ambiguous/);
+		expect(buildMemoryContext()).not.toContain("## Scope: project:chezmoi#");
+	});
+
+	test("dedupes extras and excludes the own scope", () => {
+		process.env.PI_MEMORY_SNAPSHOT = "stable";
+		fs.writeFileSync(path.join(root, "global", "MEMORY.md"), "GLOBAL_ONCE", "utf-8");
+		fs.writeFileSync(path.join(root, "projects", "chezmoi-d24458d5", "MEMORY.md"), "OWN_SCOPE", "utf-8");
+
+		applyScopeSetChange(["global", "global"]);
+
+		const ctx = buildMemoryContext();
+		expect(ctx.match(/## Scope: global/g)).toHaveLength(1);
+		expect(ctx).toContain("## Scope: project:chezmoi");
+	});
+
+	test("ensures collections for the new set without creating scope directories", async () => {
+		process.env.PI_MEMORY_SNAPSHOT = "per-turn";
+		const calls: string[][] = [];
+		_setExecFileForTest(((_file: string, args: string[], _opts: any, cb: any) => {
+			calls.push([...args]);
+			if (args[0] === "collection" && args[1] === "show") {
+				cb(null, `Path: ${path.join(root, "global")}\n`, "");
+				return;
+			}
+			cb(null, "", "");
+		}) as any);
+
+		applyScopeSetChange(["global"]);
+		await new Promise((resolve) => setTimeout(resolve, 25));
+
+		expect(calls.some((args) => args[0] === "collection" && args[1] === "show" && args[2] === "pi-memory")).toBe(
+			true,
+		);
+		expect(fs.readdirSync(path.join(root, "projects")).sort()).toEqual(["chezmoi-d24458d5", "other-aaaa1111"]);
 	});
 });
