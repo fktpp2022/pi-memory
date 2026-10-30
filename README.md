@@ -156,9 +156,9 @@ exist, so a typo cannot leave a junk scope behind.
 ### Interactive panel
 
 In a TUI, bare `/memory` opens an interactive panel in pi's picker style
-instead of printing the report. Below a two-line header (active scopes and
-memory root) it lists the session's own scope, the project scopes found on
-disk, and the two action rows:
+instead of printing the report. Below a one-line header (`Scopes: … · Root: …`)
+it lists the session's own scope, the project scopes found on disk, and the two
+action rows:
 
 | Key | Effect |
 |-----|--------|
@@ -173,19 +173,20 @@ Row order:
    session always reads and writes it and can never drop it.
 2. **Project scopes** — every project scope on disk, A→Z. A slug shared by two
    projects is shown hash-qualified (`project:chezmoi#d24458d5`).
-3. **`global`** — an opt-in extra when it is not the own scope. Outside a
-   repository `global` *is* the own scope, so it becomes the locked first row.
+3. **`global`** — an opt-in extra when it is not the own scope and its
+   directory exists on disk. Outside a repository `global` *is* the own scope,
+   so it becomes the locked first row.
 4. **`Status`** and **`Migrate`** — action rows.
 
 Applying writes the same session-only command layer as `/memory scope`: the
 injected context reflects the new set on the next turn, nothing is written to
 the project config, and the next session starts again from env, config, or the
-default. The panel stays open after applying and the header shows the resulting
-set, so you can confirm before closing.
+default. The panel stays open after applying, shows the refreshed header plus a
+summary line naming the applied set, so you can confirm before closing.
 
-`enter` on `Status` expands a block under the header with the memory root, each
-active scope's directory (exists or missing) and qmd, collection and embeddings
-readiness; `enter` again collapses it. `enter` on `Migrate` shows the plan and
+`enter` on `Status` expands a block under the header with each active scope's
+directory (exists or missing) and qmd, collection and embeddings readiness;
+`enter` again collapses it. `enter` on `Migrate` shows the plan and
 asks for confirmation before moving anything — declining leaves everything
 untouched and the panel open, a plan with nothing left to do reports
 `nothing to migrate` instead of asking, and an installed legacy

@@ -1891,9 +1891,12 @@ export interface MemoryStatusSnapshot {
 /**
  * Shared status gathering for the `memory_status` tool and the /memory panel:
  * one place for qmd detection, per-scope collection state and the global
- * collection/embeddings readiness. Callers format the result themselves.
+ * collection/embeddings readiness. It owns its precondition — the own scope's
+ * directories exist — so every caller reports the same layout. Callers format
+ * the result themselves.
  */
 export async function gatherMemoryStatus(): Promise<MemoryStatusSnapshot> {
+	ensureDirs();
 	const qmdOk = qmdAvailable || (await detectQmd());
 	let collectionOk = false;
 	let embeddings: MemoryStatusSnapshot["embeddings"] = "n/a";
@@ -2323,11 +2326,10 @@ export function _getSnapshotStateForTest(): { reason: string | null; dirty: bool
  */
 export function applyScopeSetChange(extraScopes: string[]): void {
 	const known = listKnownScopes(memoryRoot);
-	const ownDisplay = displayScopeId(ownScopeId);
 	const resolved: string[] = [];
 	for (const ref of extraScopes) {
 		const id = resolveScopeReference(ref, known);
-		if (id === ownScopeId || displayScopeId(id) === ownDisplay) continue;
+		if (id === ownScopeId) continue;
 		const dir = scopeDirPath(memoryRoot, id);
 		if (dir && path.resolve(dir) === path.resolve(MEMORY_DIR)) continue;
 		if (!resolved.includes(id)) resolved.push(id);
@@ -2383,21 +2385,35 @@ function buildScopeReport(projectRoot: string | null): string {
 const MEMORY_VERBS = ["scope", "scopes", "migrate"];
 
 /**
+ * Display labels for a set of ids: a non-global slug shared by two scopes is
+ * hash-qualified, everything else keeps its display form. Shared by the
+ * command completions and the panel so the ambiguity rule lives in one place.
+ */
+function ambiguousLabels(ids: readonly string[]): Map<string, string> {
+	const displayCounts = new Map<string, number>();
+	for (const id of ids) {
+		const display = displayScopeId(id);
+		if (display !== "global") displayCounts.set(display, (displayCounts.get(display) ?? 0) + 1);
+	}
+	const labels = new Map<string, string>();
+	for (const id of ids) {
+		const display = displayScopeId(id);
+		labels.set(id, display !== "global" && (displayCounts.get(display) ?? 0) > 1 ? id : display);
+	}
+	return labels;
+}
+
+/**
  * Scope ids offered as completions. The display form is used when it is
  * unambiguous; a bare slug shared by two projects is offered hash-qualified
  * so the completion can never supply an id the parser would reject.
  */
 function scopeCompletionIds(): string[] {
 	const known = listKnownScopes(memoryRoot);
-	const displayCounts = new Map<string, number>();
-	for (const id of known) {
-		const display = displayScopeId(id);
-		if (display !== "global") displayCounts.set(display, (displayCounts.get(display) ?? 0) + 1);
-	}
+	const labels = ambiguousLabels(known);
 	const ids: string[] = [];
 	for (const id of known) {
-		const display = displayScopeId(id);
-		const value = display !== "global" && (displayCounts.get(display) ?? 0) > 1 ? id : display;
+		const value = labels.get(id) ?? displayScopeId(id);
 		if (!ids.includes(value)) ids.push(value);
 	}
 	return ids;
@@ -2420,7 +2436,8 @@ function memoryArgumentCompletions(argumentPrefix: string): Array<{ value: strin
 /**
  * Everything the panel needs to decide what a row does. Held as full scope ids
  * so an ambiguous slug is addressed exactly; `staged` never contains the own
- * scope, which is read-only.
+ * scope, which is locked: never unticked. `globalExists` gates the opt-in
+ * `global` row on the directory actually being on disk.
  */
 export interface MemoryPanelState {
 	ownScope: string;
@@ -2428,11 +2445,13 @@ export interface MemoryPanelState {
 	staged: string[];
 	/** Whether the Status block is expanded in the header. */
 	statusExpanded: boolean;
+	/** Whether `<memory root>/global` exists; the own `global` row is unaffected. */
+	globalExists: boolean;
 }
 
 export interface MemoryPanelRow {
-	/** Full scope id: the value a toggle stages. */
-	scopeId: string;
+	/** Row identity: a full scope id for scope rows, a sentinel for action rows. */
+	rowId: string;
 	/** Display id, hash-qualified when the bare slug is shared by two projects. */
 	label: string;
 	locked: boolean;
@@ -2442,6 +2461,8 @@ export interface MemoryPanelRow {
 	action?: "status" | "migrate";
 }
 
+/** Status row id; scope ids are `global` or `project:...`, so this cannot collide. */
+export const MEMORY_PANEL_STATUS_ROW_ID = "status";
 /** Migrate row id; scope ids are `global` or `project:...`, so this cannot collide. */
 export const MEMORY_PANEL_MIGRATE_ROW_ID = "action:migrate";
 
@@ -2477,21 +2498,14 @@ function panelOwnScopeMatcher(ownScope: string): (id: string) => boolean {
 }
 
 /**
- * Label per known id, reusing the command-completion ambiguity rule: a bare
- * project slug shared by two projects is rendered hash-qualified.
+ * Own-scope matcher for the panel and header. The session stores its own id in
+ * display form while the panel addresses it hash-qualified, so both forms
+ * count as the own entry; a same-slug sibling stays distinct.
  */
-function panelRowLabels(known: readonly string[]): Map<string, string> {
-	const displayCounts = new Map<string, number>();
-	for (const id of known) {
-		const display = displayScopeId(id);
-		if (display !== "global") displayCounts.set(display, (displayCounts.get(display) ?? 0) + 1);
-	}
-	const labels = new Map<string, string>();
-	for (const id of known) {
-		const display = displayScopeId(id);
-		labels.set(id, display !== "global" && (displayCounts.get(display) ?? 0) > 1 ? id : display);
-	}
-	return labels;
+function panelOwnIdMatcher(ownScope: string): (id: string) => boolean {
+	const isOwn = panelOwnScopeMatcher(ownScope);
+	const ownDisplay = displayScopeId(ownScope);
+	return (id) => isOwn(id) || (id === ownDisplay && parseScopeId(id)?.hash === undefined);
 }
 
 /** Start a panel session from the applied scope set; staged starts equal to it. */
@@ -2499,25 +2513,26 @@ export function createMemoryPanelState(
 	ownScope: string,
 	known: readonly string[],
 	activeScopes: readonly string[],
+	globalExists = true,
 ): MemoryPanelState {
-	const isOwn = panelOwnScopeMatcher(ownScope);
+	const isOwn = panelOwnIdMatcher(ownScope);
 	const staged: string[] = [];
 	for (const id of activeScopes) {
 		if (!isOwn(id) && !staged.includes(id)) staged.push(id);
 	}
-	return { ownScope, known: [...known], staged, statusExpanded: false };
+	return { ownScope, known: [...known], staged, statusExpanded: false, globalExists };
 }
 
 /**
  * Row order: own scope pinned first and locked, project scopes A-Z, then
- * `global` when it is not the own scope.
+ * `global` when it is not the own scope and exists on disk.
  */
 export function buildMemoryPanelRows(state: MemoryPanelState): MemoryPanelRow[] {
-	const isOwn = panelOwnScopeMatcher(state.ownScope);
-	const labels = panelRowLabels(state.known);
+	const isOwn = panelOwnIdMatcher(state.ownScope);
+	const labels = ambiguousLabels(state.known);
 	const rows: MemoryPanelRow[] = [
 		{
-			scopeId: state.ownScope,
+			rowId: state.ownScope,
 			label: labels.get(state.ownScope) ?? displayScopeId(state.ownScope),
 			locked: true,
 			isOwn: true,
@@ -2531,7 +2546,7 @@ export function buildMemoryPanelRows(state: MemoryPanelState): MemoryPanelRow[] 
 		.sort((a, b) => a.label.localeCompare(b.label));
 	for (const project of projects) {
 		rows.push({
-			scopeId: project.id,
+			rowId: project.id,
 			label: project.label,
 			locked: false,
 			isOwn: false,
@@ -2539,9 +2554,9 @@ export function buildMemoryPanelRows(state: MemoryPanelState): MemoryPanelRow[] 
 		});
 	}
 
-	if (state.ownScope !== "global" && state.known.includes("global")) {
+	if (state.ownScope !== "global" && state.known.includes("global") && state.globalExists) {
 		rows.push({
-			scopeId: "global",
+			rowId: "global",
 			label: "global",
 			locked: false,
 			isOwn: false,
@@ -2550,7 +2565,7 @@ export function buildMemoryPanelRows(state: MemoryPanelState): MemoryPanelRow[] 
 	}
 
 	rows.push({
-		scopeId: "status",
+		rowId: MEMORY_PANEL_STATUS_ROW_ID,
 		label: "Status",
 		locked: false,
 		isOwn: false,
@@ -2558,7 +2573,7 @@ export function buildMemoryPanelRows(state: MemoryPanelState): MemoryPanelRow[] 
 		action: "status",
 	});
 	rows.push({
-		scopeId: MEMORY_PANEL_MIGRATE_ROW_ID,
+		rowId: MEMORY_PANEL_MIGRATE_ROW_ID,
 		label: "Migrate",
 		locked: false,
 		isOwn: false,
@@ -2573,12 +2588,12 @@ export function buildMemoryPanelRows(state: MemoryPanelState): MemoryPanelRow[] 
  * not exist are ignored. Staged extras keep row order, so applying is
  * deterministic.
  */
-export function toggleMemoryPanelRow(state: MemoryPanelState, scopeId: string): MemoryPanelState {
-	const row = buildMemoryPanelRows(state).find((candidate) => candidate.scopeId === scopeId);
+export function toggleMemoryPanelRow(state: MemoryPanelState, rowId: string): MemoryPanelState {
+	const row = buildMemoryPanelRows(state).find((candidate) => candidate.rowId === rowId);
 	if (!row || row.locked || row.action) return state;
 	const staged = row.staged
-		? state.staged.filter((id) => id !== scopeId)
-		: state.staged.filter((id) => id !== scopeId).concat(scopeId);
+		? state.staged.filter((id) => id !== rowId)
+		: state.staged.filter((id) => id !== rowId).concat(rowId);
 	return { ...state, staged };
 }
 
@@ -2610,36 +2625,52 @@ export function activateMemoryPanelRow(
 	migration?: MemoryPanelMigration,
 ): MemoryPanelAction {
 	const rows = buildMemoryPanelRows(state);
-	const row = rows.find((candidate) => candidate.scopeId === rowId);
+	const row = rows.find((candidate) => candidate.rowId === rowId);
 	if (!row) return { kind: "none" };
 	if (row.action === "status") return { kind: "status", expanded: !state.statusExpanded };
 	if (row.action === "migrate") return migration ? migratePanelAction(migration) : { kind: "none" };
 	const extraScopes = rows
 		.filter((candidate) => !candidate.isOwn && candidate.staged)
-		.map((candidate) => candidate.scopeId);
+		.map((candidate) => candidate.rowId);
 	return { kind: "apply", extraScopes };
 }
 
 /**
- * Header line(s): the active scope set with the own scope marked, plus the
- * memory root. It is rebuilt from the applied set on every render, so applying
- * a staged change shows the new set without reopening the panel. When status
- * data is supplied (Status expanded), a block with each active scope's
+ * One-line confirmation of the applied set, rendered under the refreshed
+ * header after a successful apply (spec: header plus a summary line).
+ */
+export function buildMemoryPanelSummary(state: MemoryPanelState): string {
+	const scopes = buildMemoryPanelRows(state)
+		.filter((row) => row.staged && !row.action)
+		.map((row) => `${row.label}${row.isOwn ? " (own)" : ""}`);
+	return `Applied: ${scopes.join(", ")}`;
+}
+
+/**
+ * Header: one line with the active scope set (own marked) and the memory root,
+ * rebuilt from the applied set on every render. Labels reuse the shared
+ * ambiguity rule, so two active same-slug scopes stay distinguishable. When
+ * status data is supplied (Status expanded), a block with each active scope's
  * directory and qmd readiness follows.
  */
 export function buildMemoryPanelHeader(
+	ownScope: string,
 	activeScopes: readonly string[],
 	memoryRoot: string,
 	status?: MemoryStatusSnapshot | null,
 ): string {
-	const ownId = activeScopes[0];
+	const labels = ambiguousLabels(activeScopes);
+	const isOwn = panelOwnIdMatcher(ownScope);
 	const scopes = activeScopes
-		.map((id) => (id === ownId ? `${displayScopeId(id)} (own)` : displayScopeId(id)))
+		.map((id) => {
+			const label = labels.get(id) ?? displayScopeId(id);
+			return isOwn(id) ? `${label} (own)` : label;
+		})
 		.join(", ");
-	const lines = [`Scopes: ${scopes}`, `Root: ${memoryRoot}`];
+	const lines = [`Scopes: ${scopes} · Root: ${memoryRoot}`];
 	if (status) {
 		const mark = (ok: boolean) => (ok ? "✓" : "✗");
-		lines.push("Status:", `- Root: ${memoryRoot}`);
+		lines.push("Status:");
 		for (const scope of status.scopes) {
 			lines.push(
 				`- ${scope.id}${scope.own ? " (own)" : ""}: ${scope.dir} — ${scope.dirExists ? "exists ✓" : "missing ✗"}`,
@@ -2672,7 +2703,12 @@ function panelOwnScopeId(): string {
 }
 
 function currentPanelState(): MemoryPanelState {
-	return createMemoryPanelState(panelOwnScopeId(), listKnownScopes(memoryRoot), activeScopeSet);
+	return createMemoryPanelState(
+		panelOwnScopeId(),
+		listKnownScopes(memoryRoot),
+		activeScopeSet,
+		fs.existsSync(path.join(memoryRoot, "global")),
+	);
 }
 
 /** Fresh Migrate preview: the installed-extension refusal first, then the existing planner. */
@@ -2694,7 +2730,7 @@ interface MemoryPanelActions {
 	/** Rebuild the list state from the applied set after a successful apply. */
 	freshState: () => MemoryPanelState;
 	/** Header rebuilt from the applied set and, when expanded, the current status. */
-	header: (status: MemoryStatusSnapshot | null) => string;
+	header: (ownScope: string, status: MemoryStatusSnapshot | null) => string;
 	/** Gather the same status data the memory_status tool reports. */
 	status: () => Promise<MemoryStatusSnapshot>;
 	/** Fresh migration preview from the existing planner, or the installed-extension refusal. */
@@ -2719,6 +2755,8 @@ class MemoryPanelView implements Component {
 	private status: MemoryStatusSnapshot | null = null;
 	private statusRequest = 0;
 	private selectedIndex = 0;
+	/** Last successful apply, shown as a summary line under the header. */
+	private summary: string | null = null;
 	private readonly theme: Theme;
 	private readonly actions: MemoryPanelActions;
 	private readonly requestRender: () => void;
@@ -2745,20 +2783,20 @@ class MemoryPanelView implements Component {
 		const items = buildMemoryPanelRows(this.state).map((row) => {
 			if (row.action === "status") {
 				return {
-					value: row.scopeId,
+					value: row.rowId,
 					label: `${row.label}${this.state.statusExpanded ? " (expanded)" : ""}`,
 					description: this.state.statusExpanded ? "enter to collapse" : "enter to show paths and qmd readiness",
 				};
 			}
 			if (row.action === "migrate") {
 				return {
-					value: row.scopeId,
+					value: row.rowId,
 					label: row.label,
 					description: "plan and apply the scope layout migration",
 				};
 			}
 			return {
-				value: row.scopeId,
+				value: row.rowId,
 				label: `${row.staged ? "[x]" : "[ ]"} ${row.label}${row.isOwn ? " (own)" : ""}`,
 				description: row.locked ? "locked: this session's scope" : undefined,
 			};
@@ -2780,8 +2818,8 @@ class MemoryPanelView implements Component {
 		this.list = this.buildList();
 	}
 
-	private toggle(scopeId: string) {
-		const next = toggleMemoryPanelRow(this.state, scopeId);
+	private toggle(rowId: string) {
+		const next = toggleMemoryPanelRow(this.state, rowId);
 		if (next === this.state) return;
 		this.state = next;
 		this.rebuild();
@@ -2819,6 +2857,7 @@ class MemoryPanelView implements Component {
 			return;
 		}
 		this.state = { ...this.actions.freshState(), statusExpanded: wasExpanded };
+		this.summary = buildMemoryPanelSummary(this.state);
 		this.rebuild();
 		// The block describes the applied set, so refresh it when the apply changed it.
 		if (wasExpanded) void this.loadStatus();
@@ -2864,8 +2903,9 @@ class MemoryPanelView implements Component {
 	}
 
 	render(width: number): string[] {
-		const header = this.actions.header(this.state.statusExpanded ? this.status : null);
-		return [...header.split("\n"), ...this.list.render(width)];
+		const header = this.actions.header(this.state.ownScope, this.state.statusExpanded ? this.status : null);
+		const lines = this.summary ? [header, this.summary] : [header];
+		return [...lines.join("\n").split("\n"), ...this.list.render(width)];
 	}
 
 	invalidate(): void {
@@ -2890,7 +2930,7 @@ async function openMemoryPanel(ctx: ExtensionCommandContext): Promise<void> {
 					}
 				},
 				freshState: currentPanelState,
-				header: (status) => buildMemoryPanelHeader(activeScopeSet, memoryRoot, status),
+				header: (ownScope, status) => buildMemoryPanelHeader(ownScope, activeScopeSet, memoryRoot, status),
 				status: gatherMemoryStatus,
 				migratePreview: buildMemoryPanelMigration,
 				confirmMigrate: (summary) => ctx.ui.confirm("Migrate memory layout?", summary),
