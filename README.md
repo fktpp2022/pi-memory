@@ -144,7 +144,7 @@ and group their output per scope.
 
 | Command | Effect |
 |---|---|
-| `/memory` | Active scope set (own marked), which layer set it, and the config file in play |
+| `/memory` | In a TUI, opens the [interactive panel](#interactive-panel); otherwise prints the active scope set (own marked), which layer set it, and the config file in play |
 | `/memory scope <id>…` | Replace the extras for this session only (not persisted) |
 | `/memory scope` | Reset the extras to the next layer down (env, config, default) |
 | `/memory scopes` | List every known scope |
@@ -152,6 +152,51 @@ and group their output per scope.
 
 Scopes are never auto-created: an unknown id is an error listing the scopes that
 exist, so a typo cannot leave a junk scope behind.
+
+### Interactive panel
+
+In a TUI, bare `/memory` opens an interactive panel in pi's picker style
+instead of printing the report. Below a one-line header (`Scopes: … · Root: …`)
+it lists the session's own scope, the project scopes found on disk, and the two
+action rows:
+
+| Key | Effect |
+|-----|--------|
+| `↑` / `↓` | Move the highlight |
+| `space` or `tab` | Stage or unstage the highlighted scope (scope rows only) |
+| `enter` | Apply the staged set on a scope row; expand or collapse `Status`; plan `Migrate` |
+| `esc` | Close without applying anything |
+
+Row order:
+
+1. **Own scope** — pinned first, labelled `(own)` and locked, because this
+   session always reads and writes it and can never drop it.
+2. **Project scopes** — every project scope on disk, A→Z. A slug shared by two
+   projects is shown hash-qualified (`project:chezmoi#d24458d5`).
+3. **`global`** — an opt-in extra when it is not the own scope and its
+   directory exists on disk. Outside a repository `global` *is* the own scope,
+   so it becomes the locked first row.
+4. **`Status`** and **`Migrate`** — action rows.
+
+Applying writes the same session-only command layer as `/memory scope`: the
+injected context reflects the new set on the next turn, nothing is written to
+the project config, and the next session starts again from env, config, or the
+default. The panel stays open after applying, shows the refreshed header plus a
+summary line naming the applied set, so you can confirm before closing.
+
+`enter` on `Status` expands a block under the header with each active scope's
+directory (exists or missing) and qmd, collection and embeddings readiness;
+`enter` again collapses it. The directories appear immediately, `qmd` shows a
+spinning `checking` indicator until the probe finishes, and a failed probe is
+reported in the block instead of leaving it blank. Collapsing while the probe
+is still running cancels it and says `status check canceled`. `enter` on `Migrate` shows the plan and
+asks for confirmation before moving anything — declining leaves everything
+untouched and the panel open, a plan with nothing left to do reports
+`nothing to migrate` instead of asking, and an installed legacy
+`memory-scope.ts` extension produces the same refusal as the command.
+
+Outside a TUI (print, JSON, RPC) bare `/memory` still prints the report, and
+every `/memory` verb keeps its existing behaviour.
 
 ## File layout
 

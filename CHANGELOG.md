@@ -27,6 +27,13 @@ follows [Semantic Versioning](https://semver.org/).
 - `memory_status` reports the per-scope directories and qmd collections, plus
   orphaned collections and embedding chunks (`qmd cleanup` is suggested, never
   run).
+- **Interactive `/memory` panel.** Bare `/memory` in a TUI opens a picker-style
+  panel: arrows move, space or tab stage a scope, enter applies the staged set
+  or expands the `Status` row, and `esc` closes without applying. Rows list the
+  locked own scope, on-disk project scopes A→Z, `global` as an opt-in extra,
+  then `Status` (paths and qmd readiness) and `Migrate` (plan, confirm, apply).
+  Selections are session-only and never persisted; in print, JSON and RPC the
+  bare command still prints the report, and every verb is unchanged.
 
 ### Changed
 
@@ -37,6 +44,15 @@ follows [Semantic Versioning](https://semver.org/).
 - **Upgrading does not move existing memory automatically.** Until
   `/memory migrate --apply` runs, memory stays in the old flat location and is
   not indexed. The plan output shows exactly what will move.
+
+### Fixed
+
+- Expanding `Status` in the `/memory` panel now paints the scope directories
+  immediately with a spinning `qmd: ⠋ checking` indicator (pi's Loader frame
+  cadence), fills in qmd readiness when the probe lands, and reports a failed
+  probe instead of leaving the block blank — previously the block stayed empty
+  for the full multi-second probe, so the row looked like a no-op. Collapsing
+  mid-probe cancels it and reports `status check canceled`.
 
 ## [0.4.2] — 2026-08-10
 

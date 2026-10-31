@@ -29,13 +29,18 @@ import {
 	_setMemoryRoot,
 	_setQmdAvailable,
 	_setScopeSetForTest,
+	activateMemoryPanelRow,
 	applyScopeSetChange,
 	buildMemoryContext,
+	buildMemoryPanelHeader,
+	buildMemoryPanelRows,
+	buildMemoryPanelSummary,
 	buildQmdEnv,
 	buildQmdSpawn,
 	clampSearchLimit,
 	collectCollectionDiagnostics,
 	collectionNameForScope,
+	createMemoryPanelState,
 	dailyPath,
 	dailyPathIn,
 	ensureDirs,
@@ -43,6 +48,7 @@ import {
 	ensureScopeCollection,
 	forgetBlocks,
 	formatScopedSections,
+	gatherMemoryStatus,
 	getEmbedProbeTimeoutMs,
 	getExitSummaryReasoningEffort,
 	getExitSummaryTimeoutMs,
@@ -52,6 +58,8 @@ import {
 	isExitSummaryEnabled,
 	listKnownScopes,
 	loadProjectConfig,
+	MEMORY_PANEL_MIGRATE_ROW_ID,
+	MEMORY_PANEL_STATUS_ROW_ID,
 	memoryDirWarning,
 	movePathSync,
 	nowTimestamp,
@@ -93,6 +101,7 @@ import {
 	serializeScratchpad,
 	shortSessionId,
 	todayStr,
+	toggleMemoryPanelRow,
 	yesterdayStr,
 } from "../index.js";
 
@@ -3881,6 +3890,16 @@ describe("memory_status scopes", () => {
 		expect(text).not.toContain("#aaaa1111");
 		expect(result.details.scopes.map((scope: any) => scope.id)).toEqual(["project:chezmoi", "project:other"]);
 	});
+
+	test("gathering status ensures the own scope's directories exist", async () => {
+		fs.rmSync(ownDir(), { recursive: true, force: true });
+		expect(fs.existsSync(ownDir())).toBe(false);
+
+		const status = await gatherMemoryStatus();
+
+		expect(fs.existsSync(path.join(ownDir(), "daily"))).toBe(true);
+		expect(status.scopes[0]).toMatchObject({ id: "project:chezmoi", own: true, dirExists: true });
+	});
 });
 
 // ==========================================================================
@@ -4722,6 +4741,19 @@ describe("scope-set change snapshot invalidation", () => {
 		expect(ctx).toContain("## Scope: project:chezmoi");
 	});
 
+	test("keeps an explicit sibling scope that shares the own scope's slug", () => {
+		process.env.PI_MEMORY_SNAPSHOT = "stable";
+		fs.mkdirSync(path.join(root, "projects", "chezmoi-bbbb2222"), { recursive: true });
+		fs.writeFileSync(path.join(root, "projects", "chezmoi-d24458d5", "MEMORY.md"), "OWN_SIBLING", "utf-8");
+		fs.writeFileSync(path.join(root, "projects", "chezmoi-bbbb2222", "MEMORY.md"), "SIBLING_EXTRA", "utf-8");
+
+		applyScopeSetChange(["project:chezmoi#bbbb2222"]);
+
+		const ctx = buildMemoryContext();
+		expect(ctx).toContain("SIBLING_EXTRA");
+		expect(ctx.match(/## Scope: project:chezmoi/g)).toHaveLength(2);
+	});
+
 	test("ensures collections for the new set without creating scope directories", async () => {
 		process.env.PI_MEMORY_SNAPSHOT = "per-turn";
 		const calls: string[][] = [];
@@ -4899,6 +4931,117 @@ describe("/memory command", () => {
 
 		await runCommand("");
 		expect(lastContent()).toContain("Source: default");
+	});
+
+	const tuiCtx = (uiOverrides: Record<string, unknown> = {}) => ({
+		...commandCtx(),
+		mode: "tui",
+		hasUI: true,
+		ui: { notify: mock(() => {}), custom: mock(() => Promise.resolve(undefined)), ...uiOverrides },
+	});
+
+	test("bare invocation in TUI opens the panel instead of printing the report", async () => {
+		let factory: unknown;
+		const custom = mock((opened: unknown) => {
+			factory = opened;
+			return Promise.resolve(undefined);
+		});
+
+		await mockPi.commands.memory.options.handler("", tuiCtx({ custom }));
+
+		expect(custom).toHaveBeenCalledTimes(1);
+		expect(typeof factory).toBe("function");
+		expect(mockPi.messages).toHaveLength(0);
+	});
+
+	test("closing the panel without enter leaves the applied set untouched", async () => {
+		const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+		const tui = { requestRender: () => {} };
+		const keybindings = { matches: () => false };
+
+		await mockPi.commands.memory.options.handler(
+			"",
+			tuiCtx({
+				custom: mock((factory: any) => {
+					const component = factory(tui, theme, keybindings, () => {});
+					expect(typeof component.render).toBe("function");
+					expect(typeof component.handleInput).toBe("function");
+					return Promise.resolve(undefined);
+				}),
+			}),
+		);
+
+		await mockPi.commands.memory.options.handler("", { ...commandCtx(), mode: "print" });
+
+		expect(lastContent()).toContain("Source: default");
+		expect(lastContent()).not.toContain("project:other");
+	});
+
+	/** Open the panel and hand back its live component for key input. */
+	const openPanel = async () => {
+		let component: any;
+		const closed = mock(() => {});
+		const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+		await mockPi.commands.memory.options.handler(
+			"",
+			tuiCtx({
+				custom: mock((factory: any) => {
+					component = factory({ requestRender: () => {} }, theme, { matches: () => false }, closed);
+					return Promise.resolve(undefined);
+				}),
+			}),
+		);
+		return { component, closed };
+	};
+	const printReport = async () => {
+		await mockPi.commands.memory.options.handler("", { ...commandCtx(), mode: "print" });
+		return lastContent();
+	};
+
+	test("enter applies the staged set, reports source command, and keeps the panel open", async () => {
+		const { component, closed } = await openPanel();
+		component.handleInput("\u001b[B"); // down: the first project row (chezmoi)
+		component.handleInput("\t"); // tab stages it
+		component.handleInput("\r"); // enter applies
+
+		expect(closed).not.toHaveBeenCalled();
+		const report = await printReport();
+		expect(report).toContain("Source: command");
+		expect(report).toContain("project:chezmoi");
+	});
+
+	test("esc closes the panel and discards staged changes", async () => {
+		const { component, closed } = await openPanel();
+		component.handleInput("\u001b[B");
+		component.handleInput(" "); // space stages the same row
+		component.handleInput("\u001b"); // esc closes without applying
+
+		expect(closed).toHaveBeenCalledTimes(1);
+		const report = await printReport();
+		expect(report).toContain("Source: default");
+		expect(report).not.toContain("project:chezmoi");
+	});
+
+	test("bare invocation outside TUI (print, json, rpc) still prints the report", async () => {
+		for (const mode of ["print", "json", "rpc"] as const) {
+			const custom = mock(() => Promise.resolve(undefined));
+			await mockPi.commands.memory.options.handler("", {
+				...commandCtx(),
+				mode,
+				hasUI: mode === "rpc",
+				ui: { notify: mock(() => {}), custom },
+			});
+
+			expect(custom).not.toHaveBeenCalled();
+			expect(lastContent()).toContain(`Scopes: project:${scopeSlug(projectDir)} (own)`);
+		}
+	});
+
+	test("verbs keep printing their output in TUI mode", async () => {
+		await mockPi.commands.memory.options.handler("scopes", tuiCtx());
+
+		expect(lastContent()).toContain("Known scopes:");
+		expect(lastContent()).toContain("- project:other");
 	});
 });
 
@@ -5107,5 +5250,649 @@ describe("PI_MEMORY_DIR points at the memory root", () => {
 			expect(content.split("\n")).toHaveLength(3);
 			expect(content).not.toContain("Warning:");
 		});
+	});
+});
+
+// ==========================================================================
+// 19. `/memory` panel list state (pure functions)
+// ==========================================================================
+
+describe("/memory panel list state", () => {
+	const own = "project:app#11111111";
+	const known = ["global", "project:chezmoi#d24458d5", "project:other#aaaa1111", "project:app#11111111"];
+
+	test("pins the own scope first and locked, then projects A-Z, then global", () => {
+		const rows = buildMemoryPanelRows(createMemoryPanelState(own, known, [own]));
+
+		expect(rows.map((row) => row.rowId)).toEqual([
+			own,
+			"project:chezmoi#d24458d5",
+			"project:other#aaaa1111",
+			"global",
+			MEMORY_PANEL_STATUS_ROW_ID,
+			MEMORY_PANEL_MIGRATE_ROW_ID,
+		]);
+		expect(rows[0]).toMatchObject({ locked: true, isOwn: true, staged: true });
+		expect(rows.slice(1).every((row) => !row.locked && !row.isOwn)).toBe(true);
+		expect(rows[1].label).toBe("project:chezmoi");
+		expect(rows[3].label).toBe("global");
+	});
+
+	test("outside a repo global is the locked own scope and is not listed twice", () => {
+		const rows = buildMemoryPanelRows(
+			createMemoryPanelState("global", ["global", "project:chezmoi#d24458d5"], ["global"]),
+		);
+
+		expect(rows.map((row) => row.label)).toEqual(["global", "project:chezmoi", "Status", "Migrate"]);
+		expect(rows[0]).toMatchObject({ locked: true, isOwn: true, staged: true });
+	});
+
+	test("hash-qualifies ambiguous project slugs and stages the full id", () => {
+		const ambiguous = ["global", "project:dotfiles#aaaa1111", "project:dotfiles#bbbb2222", "project:other#cccc3333"];
+		const rows = buildMemoryPanelRows(createMemoryPanelState("global", ambiguous, ["global"]));
+
+		expect(rows.map((row) => row.label)).toEqual([
+			"global",
+			"project:dotfiles#aaaa1111",
+			"project:dotfiles#bbbb2222",
+			"project:other",
+			"Status",
+			"Migrate",
+		]);
+		expect(rows.map((row) => row.rowId)).toEqual([
+			...ambiguous,
+			MEMORY_PANEL_STATUS_ROW_ID,
+			MEMORY_PANEL_MIGRATE_ROW_ID,
+		]);
+	});
+
+	test("staged reflects the active extras and never contains the own scope", () => {
+		const state = createMemoryPanelState(own, known, [own, "project:other#aaaa1111"]);
+		const rows = buildMemoryPanelRows(state);
+
+		expect(state.staged).toEqual(["project:other#aaaa1111"]);
+		expect(rows.map((row) => [row.label, row.staged])).toEqual([
+			["project:app", true],
+			["project:chezmoi", false],
+			["project:other", true],
+			["global", false],
+			["Status", false],
+			["Migrate", false],
+		]);
+	});
+
+	test("toggling an extra stages it without changing the applied state", () => {
+		const state = createMemoryPanelState(own, known, [own]);
+
+		const staged = toggleMemoryPanelRow(state, "project:chezmoi#d24458d5");
+		const rows = buildMemoryPanelRows(staged);
+
+		expect(staged.staged).toEqual(["project:chezmoi#d24458d5"]);
+		expect(rows.find((row) => row.rowId === "project:chezmoi#d24458d5")?.staged).toBe(true);
+		// The original state is untouched: applying is a separate step.
+		expect(state.staged).toEqual([]);
+		expect(buildMemoryPanelRows(state).some((row) => row.staged && !row.isOwn)).toBe(false);
+	});
+
+	test("toggling a staged extra again unstages it", () => {
+		const state = createMemoryPanelState(own, known, [own, "project:chezmoi#d24458d5"]);
+
+		const staged = toggleMemoryPanelRow(state, "project:chezmoi#d24458d5");
+
+		expect(staged.staged).toEqual([]);
+		expect(buildMemoryPanelRows(staged).find((row) => row.rowId === "project:chezmoi#d24458d5")?.staged).toBe(false);
+	});
+
+	test("the own scope ignores toggling", () => {
+		const state = createMemoryPanelState(own, known, [own]);
+
+		expect(toggleMemoryPanelRow(state, own).staged).toEqual([]);
+		expect(buildMemoryPanelRows(toggleMemoryPanelRow(state, own))[0].staged).toBe(true);
+	});
+
+	test("toggling an unknown row leaves the staged set alone", () => {
+		const state = createMemoryPanelState(own, known, [own, "global"]);
+
+		expect(toggleMemoryPanelRow(state, "project:ghost#00000000").staged).toEqual(["global"]);
+	});
+
+	test("activating a scope row asks to apply the staged extras in row order", () => {
+		const state = createMemoryPanelState(own, known, [own]);
+		const staged = toggleMemoryPanelRow(
+			toggleMemoryPanelRow(state, "project:other#aaaa1111"),
+			"project:chezmoi#d24458d5",
+		);
+
+		expect(activateMemoryPanelRow(staged, "project:other#aaaa1111")).toEqual({
+			kind: "apply",
+			extraScopes: ["project:chezmoi#d24458d5", "project:other#aaaa1111"],
+		});
+	});
+
+	test("activating the own row applies the staged extras as well", () => {
+		const state = createMemoryPanelState(own, known, [own, "global"]);
+
+		expect(activateMemoryPanelRow(state, own)).toEqual({ kind: "apply", extraScopes: ["global"] });
+	});
+
+	test("activating an unknown row does nothing", () => {
+		const state = createMemoryPanelState(own, known, [own]);
+
+		expect(activateMemoryPanelRow(state, "project:ghost#00000000")).toEqual({ kind: "none" });
+	});
+
+	test("the header is one line with the active scopes, the own marker, and the memory root", () => {
+		const header = buildMemoryPanelHeader(own, [own, "project:other#aaaa1111"], "/tmp/pi-memory-root");
+
+		expect(header).toBe("Scopes: project:app (own), project:other · Root: /tmp/pi-memory-root");
+	});
+
+	test("the header keeps two active same-slug scopes distinguishable", () => {
+		const ownSibling = "project:app#11111111";
+		const sibling = "project:app#22222222";
+
+		const header = buildMemoryPanelHeader(ownSibling, [ownSibling, sibling], "/tmp/root");
+
+		expect(header).toBe("Scopes: project:app#11111111 (own), project:app#22222222 · Root: /tmp/root");
+	});
+
+	test("offers global only when its directory exists on disk", () => {
+		const withoutGlobal = createMemoryPanelState(own, known, [own], false);
+		expect(buildMemoryPanelRows(withoutGlobal).some((row) => row.rowId === "global")).toBe(false);
+
+		const withGlobal = createMemoryPanelState(own, known, [own], true);
+		expect(buildMemoryPanelRows(withGlobal).some((row) => row.rowId === "global")).toBe(true);
+	});
+
+	test("keeps the own global row even when the global directory is missing", () => {
+		const state = createMemoryPanelState("global", ["global"], ["global"], false);
+		const rows = buildMemoryPanelRows(state);
+
+		expect(rows[0]).toMatchObject({ rowId: "global", isOwn: true, locked: true, staged: true });
+		expect(rows.filter((row) => row.rowId === "global")).toHaveLength(1);
+	});
+
+	test("the summary line names the applied set in row order", () => {
+		const state = createMemoryPanelState(own, known, [own, "global", "project:other#aaaa1111"]);
+
+		expect(buildMemoryPanelSummary(state)).toBe("Applied: project:app (own), project:other, global");
+	});
+});
+
+// ==========================================================================
+// 20. `/memory` panel Migrate row (ticket #27)
+// ==========================================================================
+
+describe("/memory panel migrate row", () => {
+	let root: string;
+	let extDir: string;
+
+	const panelState = () => createMemoryPanelState("global", ["global"], ["global"]);
+
+	const makeLegacyRoot = (): string => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-panel-migrate-"));
+		fs.mkdirSync(path.join(dir, "daily"), { recursive: true });
+		fs.writeFileSync(path.join(dir, "MEMORY.md"), "global memory\n", "utf-8");
+		fs.writeFileSync(path.join(dir, "SCRATCHPAD.md"), "todos\n", "utf-8");
+		fs.writeFileSync(path.join(dir, "daily", "2026-01-01.md"), "log\n", "utf-8");
+		return dir;
+	};
+
+	beforeEach(() => {
+		_resetBaseDir();
+		root = makeLegacyRoot();
+		extDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-panel-ext-"));
+		_setMemoryRoot(root);
+		_setScopeSetForTest("global");
+		_setExtensionsDirForTest(extDir);
+		_clearQmdStatusCaches();
+		_setQmdAvailable(false);
+	});
+
+	afterEach(() => {
+		_setExtensionsDirForTest(null);
+		_resetBaseDir();
+		_resetExecFileForTest();
+		_setQmdAvailable(false);
+		_clearQmdStatusCaches();
+		fs.rmSync(root, { recursive: true, force: true });
+		fs.rmSync(extDir, { recursive: true, force: true });
+	});
+
+	test("appends the Migrate action row after Status", () => {
+		const rows = buildMemoryPanelRows(panelState());
+
+		expect(rows.map((row) => row.label)).toEqual(["global", "Status", "Migrate"]);
+		expect(rows.at(-1)).toMatchObject({ rowId: MEMORY_PANEL_MIGRATE_ROW_ID, action: "migrate" });
+	});
+
+	test("an already-migrated plan asks for no confirmation", () => {
+		fs.rmSync(path.join(root, "MEMORY.md"));
+		fs.rmSync(path.join(root, "SCRATCHPAD.md"));
+		fs.rmSync(path.join(root, "daily"), { recursive: true });
+		fs.mkdirSync(path.join(root, "global"), { recursive: true });
+		const plan = planMemoryMigration({ memoryRoot: root, qmdAvailable: false });
+		expect(plan.alreadyMigrated).toBe(true);
+
+		const action = activateMemoryPanelRow(panelState(), MEMORY_PANEL_MIGRATE_ROW_ID, { kind: "planned", plan });
+
+		expect(action).toMatchObject({
+			kind: "migrate",
+			refusal: null,
+			plan,
+			nothingToMigrate: true,
+			summary: "",
+		});
+	});
+
+	test("a non-empty plan carries a confirmation summary of moves and collection operations", () => {
+		const plan = planMemoryMigration({
+			memoryRoot: root,
+			qmdAvailable: true,
+			collections: { "pi-memory": root },
+		});
+
+		const action = activateMemoryPanelRow(panelState(), MEMORY_PANEL_MIGRATE_ROW_ID, { kind: "planned", plan });
+
+		expect(action.kind).toBe("migrate");
+		if (action.kind !== "migrate") throw new Error("expected a migrate action");
+		expect(action.nothingToMigrate).toBe(false);
+		expect(action.refusal).toBeNull();
+		expect(action.plan).toBe(plan);
+		expect(action.summary).toContain("move    MEMORY.md");
+		expect(action.summary).toContain("-> global/MEMORY.md");
+		expect(action.summary).toContain("remove  collection pi-memory");
+		expect(action.summary).toContain("add     collection pi-memory");
+	});
+
+	test("a refusal is carried verbatim and never asks to apply", () => {
+		const message =
+			"refusing to migrate: /tmp/ext/memory-scope.ts still exists.\nRename that file, then run /reload.";
+
+		const action = activateMemoryPanelRow(panelState(), MEMORY_PANEL_MIGRATE_ROW_ID, {
+			kind: "refused",
+			message,
+		});
+
+		expect(action).toEqual({
+			kind: "migrate",
+			refusal: message,
+			plan: null,
+			nothingToMigrate: false,
+			summary: "",
+		});
+	});
+
+	test("activating Migrate without a preview does nothing", () => {
+		expect(activateMemoryPanelRow(panelState(), MEMORY_PANEL_MIGRATE_ROW_ID)).toEqual({ kind: "none" });
+	});
+
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+
+	/** Open the panel and hand back its live component plus the mocked dialogs. */
+	const openPanel = async (confirmAnswer: boolean) => {
+		let component: any;
+		const done = mock(() => {});
+		const confirm = mock(async () => confirmAnswer);
+		const notify = mock(() => {});
+		const mockPi = createMockPi();
+		registerExtension(mockPi.pi as any);
+		await mockPi.commands.memory.options.handler("", {
+			cwd: root,
+			mode: "tui",
+			hasUI: true,
+			sessionManager: { getSessionId: () => "panelmigrate0001" },
+			ui: {
+				notify,
+				confirm,
+				custom: mock((factory: any) => {
+					component = factory({ requestRender: () => {} }, theme, { matches: () => false }, done);
+					return Promise.resolve(undefined);
+				}),
+			},
+		});
+		return { component, done, confirm, notify };
+	};
+
+	/** Poll until the panel has actually settled instead of guessing with a timer. */
+	const waitFor = async (predicate: () => boolean, timeoutMs = 2_000) => {
+		const start = Date.now();
+		while (!predicate()) {
+			if (Date.now() - start > timeoutMs) throw new Error("panel did not settle in time");
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		}
+	};
+
+	/** Two downs move from the locked own scope row through Status to Migrate. */
+	const pressMigrate = (component: any) => {
+		component.handleInput("\u001b[B");
+		component.handleInput("\u001b[B");
+		component.handleInput("\r");
+	};
+
+	test("enter on an empty plan notifies and leaves the panel open", async () => {
+		fs.rmSync(path.join(root, "MEMORY.md"));
+		fs.rmSync(path.join(root, "SCRATCHPAD.md"));
+		fs.rmSync(path.join(root, "daily"), { recursive: true });
+		fs.mkdirSync(path.join(root, "global"), { recursive: true });
+		const { component, done, confirm, notify } = await openPanel(true);
+
+		pressMigrate(component);
+		await waitFor(() => notify.mock.calls.length > 0);
+
+		expect(notify.mock.calls[0]?.[0]).toBe("nothing to migrate");
+		expect(confirm).not.toHaveBeenCalled();
+		expect(done).not.toHaveBeenCalled();
+	});
+
+	test("an installed memory-scope.ts is refused with the command's exact text", async () => {
+		fs.writeFileSync(path.join(extDir, "memory-scope.ts"), "// legacy extension\n", "utf-8");
+		const refusal = (await runMemoryMigrate([])).text;
+		const { component, done, confirm, notify } = await openPanel(true);
+
+		pressMigrate(component);
+		await waitFor(() => notify.mock.calls.length > 0);
+
+		expect(notify.mock.calls[0]?.[0]).toBe(refusal);
+		expect(confirm).not.toHaveBeenCalled();
+		expect(done).not.toHaveBeenCalled();
+		expect(fs.existsSync(path.join(root, "MEMORY.md"))).toBe(true);
+		expect(fs.existsSync(path.join(root, "global"))).toBe(false);
+	});
+
+	test("confirming applies the migration and keeps the panel open", async () => {
+		const { component, done, confirm, notify } = await openPanel(true);
+
+		pressMigrate(component);
+		await waitFor(() => notify.mock.calls.length > 0);
+
+		expect(confirm).toHaveBeenCalledTimes(1);
+		const [title, summary] = confirm.mock.calls[0] as unknown as [string, string];
+		expect(title).toBeTruthy();
+		expect(summary).toContain("move    MEMORY.md");
+		expect(summary).toContain("-> global/MEMORY.md");
+		expect(fs.readFileSync(path.join(root, "global", "MEMORY.md"), "utf-8")).toBe("global memory\n");
+		expect(fs.existsSync(path.join(root, "MEMORY.md"))).toBe(false);
+		expect(notify.mock.calls[0]?.[0]).toBe("migration applied");
+		expect(done).not.toHaveBeenCalled();
+	});
+
+	test("declining leaves memory untouched and keeps the panel open", async () => {
+		const { component, done, confirm, notify } = await openPanel(false);
+
+		pressMigrate(component);
+		await waitFor(() => confirm.mock.calls.length > 0);
+
+		expect(confirm).toHaveBeenCalledTimes(1);
+		expect(fs.readFileSync(path.join(root, "MEMORY.md"), "utf-8")).toBe("global memory\n");
+		expect(fs.existsSync(path.join(root, "global"))).toBe(false);
+		expect(notify).not.toHaveBeenCalled();
+		expect(done).not.toHaveBeenCalled();
+	});
+});
+
+// ==========================================================================
+// 21. `/memory` panel Status action row (#26)
+// ==========================================================================
+
+describe("/memory panel status action", () => {
+	const own = "project:app#11111111";
+	const known = ["global", "project:chezmoi#d24458d5", "project:other#aaaa1111", "project:app#11111111"];
+
+	test("appends the Status and Migrate action rows after the global row", () => {
+		const rows = buildMemoryPanelRows(createMemoryPanelState(own, known, [own]));
+
+		expect(rows.map((row) => row.label)).toEqual([
+			"project:app",
+			"project:chezmoi",
+			"project:other",
+			"global",
+			"Status",
+			"Migrate",
+		]);
+		expect(rows[rows.length - 2]).toMatchObject({ rowId: MEMORY_PANEL_STATUS_ROW_ID, action: "status" });
+		expect(rows[rows.length - 1]).toMatchObject({ rowId: MEMORY_PANEL_MIGRATE_ROW_ID, action: "migrate" });
+	});
+
+	test("enter toggles the status block open and closed", () => {
+		const state = createMemoryPanelState(own, known, [own]);
+		expect(state.statusExpanded).toBe(false);
+
+		expect(activateMemoryPanelRow(state, MEMORY_PANEL_STATUS_ROW_ID)).toEqual({ kind: "status", expanded: true });
+
+		const opened = { ...state, statusExpanded: true };
+		expect(activateMemoryPanelRow(opened, MEMORY_PANEL_STATUS_ROW_ID)).toEqual({ kind: "status", expanded: false });
+	});
+
+	test("space and tab never stage the Status row", () => {
+		const state = createMemoryPanelState(own, known, [own]);
+
+		expect(toggleMemoryPanelRow(state, MEMORY_PANEL_STATUS_ROW_ID)).toBe(state);
+	});
+
+	test("scope toggling and apply keep working while the status block is expanded", () => {
+		const state = { ...createMemoryPanelState(own, known, [own]), statusExpanded: true };
+
+		const staged = toggleMemoryPanelRow(state, "project:chezmoi#d24458d5");
+		expect(staged.statusExpanded).toBe(true);
+		expect(staged.staged).toEqual(["project:chezmoi#d24458d5"]);
+		expect(activateMemoryPanelRow(staged, "project:chezmoi#d24458d5")).toEqual({
+			kind: "apply",
+			extraScopes: ["project:chezmoi#d24458d5"],
+		});
+		expect(activateMemoryPanelRow(staged, MEMORY_PANEL_STATUS_ROW_ID)).toEqual({ kind: "status", expanded: false });
+	});
+
+	describe("expanded header block", () => {
+		let root: string;
+
+		beforeEach(() => {
+			root = setupScopedRoot();
+			_setMemoryRoot(root);
+			_setScopeSetForTest("project:chezmoi", ["global"]);
+			_clearQmdStatusCaches();
+			_setQmdAvailable(true);
+			mockQmdRegistry({
+				"pi-memory": path.join(root, "global"),
+				"chezmoi-d24458d5": path.join(root, "projects", "chezmoi-d24458d5"),
+			});
+		});
+
+		afterEach(() => {
+			_resetExecFileForTest();
+			_resetBaseDir();
+			_setQmdAvailable(false);
+			_clearQmdStatusCaches();
+			fs.rmSync(root, { recursive: true, force: true });
+		});
+
+		test("renders the memory root, per-scope directories and qmd readiness", async () => {
+			const scopes = ["project:chezmoi#d24458d5", "global"];
+			const status = await gatherMemoryStatus();
+			const header = buildMemoryPanelHeader(scopes[0], scopes, root, { kind: "ready", snapshot: status });
+
+			expect(header.split("\n")[0]).toBe(`Scopes: project:chezmoi (own), global · Root: ${root}`);
+			expect(header.split("\n")[1]).toBe("Status:");
+			expect(header).not.toContain("- Root:");
+			expect(header).toContain(
+				`- project:chezmoi (own): ${path.join(root, "projects", "chezmoi-d24458d5")} — exists ✓`,
+			);
+			expect(header).toContain(`- global: ${path.join(root, "global")} — exists ✓`);
+			expect(header).toContain("qmd: ✓ available");
+			expect(header).toContain("`pi-memory`: ✓");
+			expect(header).toContain("embeddings: ready");
+		});
+
+		test("states when qmd is unavailable without querying collections", async () => {
+			_setQmdAvailable(false);
+			const status = await gatherMemoryStatus();
+			const header = buildMemoryPanelHeader("global", ["global"], root, { kind: "ready", snapshot: status });
+
+			expect(status.qmdAvailable).toBe(false);
+			expect(header).toContain("- qmd: ✗ unavailable");
+			expect(header).not.toContain("collection");
+			expect(header).not.toContain("embeddings:");
+		});
+
+		test("paints the scope directories immediately while qmd is still checking", () => {
+			const scopes = ["project:chezmoi#d24458d5", "global"];
+			const header = buildMemoryPanelHeader(scopes[0], scopes, root, { kind: "pending" });
+
+			expect(header.split("\n")[1]).toBe("Status:");
+			expect(header).toContain(
+				`- project:chezmoi (own): ${path.join(root, "projects", "chezmoi-d24458d5")} — exists ✓`,
+			);
+			expect(header).toContain(`- global: ${path.join(root, "global")} — exists ✓`);
+			expect(header).toContain("- qmd: ⠋ checking");
+		});
+
+		test("the checking indicator advances a frame at a time", () => {
+			const scopes = ["project:chezmoi#d24458d5"];
+			const first = buildMemoryPanelHeader(scopes[0], scopes, root, { kind: "pending", frame: 0 });
+			const second = buildMemoryPanelHeader(scopes[0], scopes, root, { kind: "pending", frame: 1 });
+
+			expect(first).toContain("- qmd: ⠋ checking");
+			expect(second).toContain("- qmd: ⠙ checking");
+		});
+
+		test("reports a failed status probe instead of leaving the block out", () => {
+			const scopes = ["project:chezmoi#d24458d5", "global"];
+			const header = buildMemoryPanelHeader(scopes[0], scopes, root, {
+				kind: "error",
+				message: "probe exploded",
+			});
+
+			expect(header).toContain(`- global: ${path.join(root, "global")} — exists ✓`);
+			expect(header).toContain("- qmd: ✗ status unavailable: probe exploded");
+		});
+
+		test("the collapsed header is unchanged", () => {
+			const header = buildMemoryPanelHeader(
+				"project:chezmoi#d24458d5",
+				["project:chezmoi#d24458d5", "global"],
+				root,
+			);
+
+			expect(header).toBe(`Scopes: project:chezmoi (own), global · Root: ${root}`);
+		});
+	});
+});
+
+// ==========================================================================
+// 22. `/memory` panel apply: refreshed header plus a summary line
+// ==========================================================================
+
+describe("/memory panel apply", () => {
+	let root: string;
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+
+	beforeEach(() => {
+		root = setupScopedRoot();
+		_setMemoryRoot(root);
+		_setScopeSetForTest("project:chezmoi");
+		_resetMemorySnapshot();
+		_clearQmdStatusCaches();
+		_setQmdAvailable(false);
+		_setExecFileForTest(((_file: string, _args: string[], _opts: any, cb: any) => cb(null, "", "")) as any);
+	});
+
+	afterEach(() => {
+		_resetExecFileForTest();
+		_resetBaseDir();
+		_resetMemorySnapshot();
+		_clearQmdStatusCaches();
+		_setQmdAvailable(false);
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	const openPanel = async () => {
+		let component: any;
+		const done = mock(() => {});
+		const notify = mock(() => {});
+		const mockPi = createMockPi();
+		registerExtension(mockPi.pi as any);
+		await mockPi.commands.memory.options.handler("", {
+			cwd: root,
+			mode: "tui",
+			hasUI: true,
+			sessionManager: { getSessionId: () => "panelapply000001" },
+			ui: {
+				notify,
+				confirm: mock(async () => true),
+				custom: mock((factory: any) => {
+					component = factory({ requestRender: () => {} }, theme, { matches: () => false }, done);
+					return Promise.resolve(undefined);
+				}),
+			},
+		});
+		return { component, done, notify };
+	};
+
+	test("applying keeps the panel open, refreshes the header and shows the applied set", async () => {
+		const { component, done } = await openPanel();
+
+		// Own scope first; one down reaches the alphabetically first project.
+		component.handleInput("\u001b[B");
+		component.handleInput(" ");
+		expect(component.render(120).some((line: string) => line.includes("Applied:"))).toBe(false);
+
+		component.handleInput("\r");
+		const rows = component.render(120);
+
+		expect(rows[0]).toBe(`Scopes: project:chezmoi (own), project:other · Root: ${root}`);
+		expect(rows[1]).toBe("Applied: project:chezmoi (own), project:other");
+		expect(done).not.toHaveBeenCalled();
+	});
+
+	/** qmd is present but every probe hangs, so the block stays pending. */
+	const hangProbe = () => {
+		_clearQmdStatusCaches();
+		_setQmdAvailable(true);
+		_setExecFileForTest((() => {}) as any);
+	};
+
+	test("expanding Status paints the block before the qmd probe lands", async () => {
+		// The probe never settles: the block must not wait for it to appear.
+		hangProbe();
+		const { component } = await openPanel();
+
+		// own, project:other, global, Status
+		for (let i = 0; i < 3; i++) component.handleInput("\u001b[B");
+		component.handleInput("\r");
+		const lines = component.render(120).join("\n");
+
+		expect(lines).toContain(`- project:chezmoi (own): ${path.join(root, "projects", "chezmoi-d24458d5")} — exists ✓`);
+		expect(lines).toContain("- qmd: ⠋ checking");
+		component.handleInput("\u001b");
+	});
+
+	test("the checking indicator animates while the probe runs", async () => {
+		hangProbe();
+		const { component } = await openPanel();
+
+		for (let i = 0; i < 3; i++) component.handleInput("\u001b[B");
+		component.handleInput("\r");
+		const first = component.render(120).join("\n");
+
+		await new Promise((resolve) => setTimeout(resolve, 200));
+		const second = component.render(120).join("\n");
+
+		expect(first).toContain("⠋ checking");
+		expect(second).toContain("checking");
+		expect(second).not.toBe(first);
+		component.handleInput("\u001b");
+	});
+
+	test("collapsing Status mid-probe says the check was canceled", async () => {
+		hangProbe();
+		const { component, notify } = await openPanel();
+
+		for (let i = 0; i < 3; i++) component.handleInput("\u001b[B");
+		component.handleInput("\r");
+		component.handleInput("\r");
+
+		expect(notify.mock.calls[0]?.[0]).toBe("status check canceled");
+		expect(component.render(120).join("\n")).not.toContain("checking");
+		component.handleInput("\u001b");
 	});
 });

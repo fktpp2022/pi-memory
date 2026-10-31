@@ -32,7 +32,7 @@ The entire extension is `index.ts` — a single default export function that rec
 
 1. **Registers lifecycle hooks**: `session_start` (resolve the scope set from `ctx.cwd`, detect qmd), `session_shutdown` (cleanup), `before_agent_start` (inject memory context into system prompt every turn), `session_before_compact` (write a handoff, refresh the snapshot)
 2. **Registers 7 tools**: `memory_write`, `memory_forget`, `memory_restore`, `memory_read`, `scratchpad`, `memory_search`, `memory_status`
-3. **Registers the `/memory` command**: report the scope set, session-only `scope` override, `scopes`, `migrate`
+3. **Registers the `/memory` command**: bare invocation opens the interactive scope panel in a TUI (and prints the report elsewhere); the `scope`, `scopes` and `migrate` verbs are unchanged
 4. **Manages files per scope under `~/.pi/agent/memory/`** (`global/`, `projects/<slug>-<hash>/`): `MEMORY.md` (long-term), `SCRATCHPAD.md` (checklist), `daily/<YYYY-MM-DD>.md` (append-only logs), `recovery/`
 
 Key design patterns:

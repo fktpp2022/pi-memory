@@ -35,10 +35,13 @@ import { complete } from "@earendil-works/pi-ai/compat";
 import {
 	convertToLlm,
 	type ExtensionAPI,
+	type ExtensionCommandContext,
 	type ExtensionContext,
 	type SessionEntry,
 	serializeConversation,
+	type Theme,
 } from "@earendil-works/pi-coding-agent";
+import { type Component, SelectList, type SelectListTheme } from "@earendil-works/pi-tui";
 
 // ---------------------------------------------------------------------------
 // Paths (mutable for testing via _setBaseDir / _resetBaseDir)
@@ -1868,6 +1871,82 @@ export async function collectCollectionDiagnostics(ctx: ScopeContext = scopeCont
 	return { scopes, orphans, orphanChunks: await probeOrphanedChunks() };
 }
 
+export interface MemoryStatusScopeRow {
+	id: string;
+	own: boolean;
+	dir: string;
+	dirExists: boolean;
+	collection: string | null;
+	collectionState: "exists" | "missing" | "unchecked";
+}
+
+export interface MemoryStatusSnapshot {
+	qmdAvailable: boolean;
+	collectionAvailable: boolean;
+	embeddings: "ready" | "missing" | "unknown" | "n/a";
+	scopes: MemoryStatusScopeRow[];
+	diagnostics: CollectionDiagnostics | null;
+}
+
+/**
+ * The panel's header block: `pending` while the probe runs, so the directories
+ * paint immediately and the qmd line spins as a visible background operation;
+ * `error` when the probe fails, so an expanded Status never looks like a no-op.
+ */
+export type MemoryPanelStatusBlock =
+	| { kind: "pending"; frame?: number }
+	| { kind: "ready"; snapshot: MemoryStatusSnapshot }
+	| { kind: "error"; message: string };
+
+/** Braille spinner matching pi's Loader defaults: 80 ms per frame. */
+const STATUS_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const STATUS_SPINNER_INTERVAL_MS = 80;
+
+/**
+ * Shared status gathering for the `memory_status` tool and the /memory panel:
+ * one place for qmd detection, per-scope collection state and the global
+ * collection/embeddings readiness. It owns its precondition — the own scope's
+ * directories exist — so every caller reports the same layout. Callers format
+ * the result themselves.
+ */
+export async function gatherMemoryStatus(): Promise<MemoryStatusSnapshot> {
+	ensureDirs();
+	const qmdOk = qmdAvailable || (await detectQmd());
+	let collectionOk = false;
+	let embeddings: MemoryStatusSnapshot["embeddings"] = "n/a";
+	let diagnostics: CollectionDiagnostics | null = null;
+	if (qmdOk) {
+		diagnostics = await collectCollectionDiagnostics();
+		collectionOk = diagnostics.scopes.some((scope) => scope.scope === "global" && scope.exists);
+		if (!collectionOk) collectionOk = await checkCollection(GLOBAL_COLLECTION_NAME);
+		embeddings = collectionOk ? await probeEmbeddings() : "n/a";
+	}
+
+	const ctx = scopeContext();
+	// Per-scope layout needs no qmd: directories and collection names are
+	// computed from the naming rule; collection state is only checked when
+	// qmd is available (never shell out from here).
+	const scopes = ctx.activeScopes.map((id) => {
+		const info = scopeInfoForId(id, ctx);
+		const dir = info?.dir ?? scopeDirPath(memoryRoot, id) ?? "?";
+		const collection = collectionNameForScope(id, info?.dir);
+		const diagnostic = diagnostics?.scopes.find((scope) => scope.scope === (info?.id ?? id));
+		const dirExists = diagnostic ? diagnostic.dirExists : dir !== "?" && fs.existsSync(dir);
+		const collectionState: "exists" | "missing" | "unchecked" =
+			!qmdOk || !dirExists || !diagnostic ? "unchecked" : diagnostic.exists ? "exists" : "missing";
+		return {
+			id: displayScopeId(info?.id ?? id),
+			own: id === ctx.ownScope,
+			dir,
+			dirExists,
+			collection,
+			collectionState,
+		};
+	});
+
+	return { qmdAvailable: qmdOk, collectionAvailable: collectionOk, embeddings, scopes, diagnostics };
+}
+
 export function detectQmd(): Promise<boolean> {
 	const now = Date.now();
 	if (qmdAvailabilityCheckedAt && now - qmdAvailabilityCheckedAt < qmdStatusTtl(qmdAvailable)) {
@@ -2261,11 +2340,10 @@ export function _getSnapshotStateForTest(): { reason: string | null; dirty: bool
  */
 export function applyScopeSetChange(extraScopes: string[]): void {
 	const known = listKnownScopes(memoryRoot);
-	const ownDisplay = displayScopeId(ownScopeId);
 	const resolved: string[] = [];
 	for (const ref of extraScopes) {
 		const id = resolveScopeReference(ref, known);
-		if (id === ownScopeId || displayScopeId(id) === ownDisplay) continue;
+		if (id === ownScopeId) continue;
 		const dir = scopeDirPath(memoryRoot, id);
 		if (dir && path.resolve(dir) === path.resolve(MEMORY_DIR)) continue;
 		if (!resolved.includes(id)) resolved.push(id);
@@ -2321,21 +2399,35 @@ function buildScopeReport(projectRoot: string | null): string {
 const MEMORY_VERBS = ["scope", "scopes", "migrate"];
 
 /**
+ * Display labels for a set of ids: a non-global slug shared by two scopes is
+ * hash-qualified, everything else keeps its display form. Shared by the
+ * command completions and the panel so the ambiguity rule lives in one place.
+ */
+function ambiguousLabels(ids: readonly string[]): Map<string, string> {
+	const displayCounts = new Map<string, number>();
+	for (const id of ids) {
+		const display = displayScopeId(id);
+		if (display !== "global") displayCounts.set(display, (displayCounts.get(display) ?? 0) + 1);
+	}
+	const labels = new Map<string, string>();
+	for (const id of ids) {
+		const display = displayScopeId(id);
+		labels.set(id, display !== "global" && (displayCounts.get(display) ?? 0) > 1 ? id : display);
+	}
+	return labels;
+}
+
+/**
  * Scope ids offered as completions. The display form is used when it is
  * unambiguous; a bare slug shared by two projects is offered hash-qualified
  * so the completion can never supply an id the parser would reject.
  */
 function scopeCompletionIds(): string[] {
 	const known = listKnownScopes(memoryRoot);
-	const displayCounts = new Map<string, number>();
-	for (const id of known) {
-		const display = displayScopeId(id);
-		if (display !== "global") displayCounts.set(display, (displayCounts.get(display) ?? 0) + 1);
-	}
+	const labels = ambiguousLabels(known);
 	const ids: string[] = [];
 	for (const id of known) {
-		const display = displayScopeId(id);
-		const value = display !== "global" && (displayCounts.get(display) ?? 0) > 1 ? id : display;
+		const value = labels.get(id) ?? displayScopeId(id);
 		if (!ids.includes(value)) ids.push(value);
 	}
 	return ids;
@@ -2349,6 +2441,603 @@ function memoryArgumentCompletions(argumentPrefix: string): Array<{ value: strin
 	const candidates = firstToken ? MEMORY_VERBS : scopeCompletionIds();
 	const matches = candidates.filter((candidate) => candidate.startsWith(current));
 	return matches.length > 0 ? matches.map((value) => ({ value, label: value })) : null;
+}
+
+// ---------------------------------------------------------------------------
+// /memory panel list state (pure; the TUI view is a thin shell over these)
+// ---------------------------------------------------------------------------
+
+/**
+ * Everything the panel needs to decide what a row does. Held as full scope ids
+ * so an ambiguous slug is addressed exactly; `staged` never contains the own
+ * scope, which is locked: never unticked. `globalExists` gates the opt-in
+ * `global` row on the directory actually being on disk.
+ */
+export interface MemoryPanelState {
+	ownScope: string;
+	known: string[];
+	staged: string[];
+	/** Whether the Status block is expanded in the header. */
+	statusExpanded: boolean;
+	/** Whether `<memory root>/global` exists; the own `global` row is unaffected. */
+	globalExists: boolean;
+}
+
+export interface MemoryPanelRow {
+	/** Row identity: a full scope id for scope rows, a sentinel for action rows. */
+	rowId: string;
+	/** Display id, hash-qualified when the bare slug is shared by two projects. */
+	label: string;
+	locked: boolean;
+	isOwn: boolean;
+	staged: boolean;
+	/** Action rows have no scope: enter runs the action instead of applying. */
+	action?: "status" | "migrate";
+}
+
+/** Status row id; scope ids are `global` or `project:...`, so this cannot collide. */
+export const MEMORY_PANEL_STATUS_ROW_ID = "status";
+/** Migrate row id; scope ids are `global` or `project:...`, so this cannot collide. */
+export const MEMORY_PANEL_MIGRATE_ROW_ID = "action:migrate";
+
+/** What the panel knows about migration before the user decides. */
+export type MemoryPanelMigration = { kind: "refused"; message: string } | { kind: "planned"; plan: MigratePlan };
+
+/** Enter on Migrate: notify (refused / nothing) or confirm and apply the plan. */
+export interface MemoryPanelMigrateAction {
+	kind: "migrate";
+	/** Verbatim refusal while the legacy memory-scope.ts is installed; null otherwise. */
+	refusal: string | null;
+	/** Plan to apply; null when refused. */
+	plan: MigratePlan | null;
+	/** No work left: notify "nothing to migrate" instead of confirming. */
+	nothingToMigrate: boolean;
+	/** Confirmation body listing the file moves and collection operations. */
+	summary: string;
+}
+
+/** What activating a row asks the command layer to do. */
+export type MemoryPanelAction =
+	| { kind: "apply"; extraScopes: string[] }
+	| { kind: "status"; expanded: boolean }
+	| MemoryPanelMigrateAction
+	| { kind: "none" };
+
+/** Matcher for the own scope: exact when hash-qualified, display form otherwise. */
+function panelOwnScopeMatcher(ownScope: string): (id: string) => boolean {
+	const ownDisplay = displayScopeId(ownScope);
+	const parsed = parseScopeId(ownScope);
+	const hashQualified = ownScope === "global" || parsed?.hash !== undefined;
+	return (id) => id === ownScope || (!hashQualified && displayScopeId(id) === ownDisplay);
+}
+
+/**
+ * Own-scope matcher for the panel and header. The session stores its own id in
+ * display form while the panel addresses it hash-qualified, so both forms
+ * count as the own entry; a same-slug sibling stays distinct.
+ */
+function panelOwnIdMatcher(ownScope: string): (id: string) => boolean {
+	const isOwn = panelOwnScopeMatcher(ownScope);
+	const ownDisplay = displayScopeId(ownScope);
+	return (id) => isOwn(id) || (id === ownDisplay && parseScopeId(id)?.hash === undefined);
+}
+
+/** Start a panel session from the applied scope set; staged starts equal to it. */
+export function createMemoryPanelState(
+	ownScope: string,
+	known: readonly string[],
+	activeScopes: readonly string[],
+	globalExists = true,
+): MemoryPanelState {
+	const isOwn = panelOwnIdMatcher(ownScope);
+	const staged: string[] = [];
+	for (const id of activeScopes) {
+		if (!isOwn(id) && !staged.includes(id)) staged.push(id);
+	}
+	return { ownScope, known: [...known], staged, statusExpanded: false, globalExists };
+}
+
+/**
+ * Row order: own scope pinned first and locked, project scopes A-Z, then
+ * `global` when it is not the own scope and exists on disk.
+ */
+export function buildMemoryPanelRows(state: MemoryPanelState): MemoryPanelRow[] {
+	const isOwn = panelOwnIdMatcher(state.ownScope);
+	const labels = ambiguousLabels(state.known);
+	const rows: MemoryPanelRow[] = [
+		{
+			rowId: state.ownScope,
+			label: labels.get(state.ownScope) ?? displayScopeId(state.ownScope),
+			locked: true,
+			isOwn: true,
+			staged: true,
+		},
+	];
+
+	const projects = state.known
+		.filter((id) => id !== "global" && !isOwn(id))
+		.map((id) => ({ id, label: labels.get(id) ?? displayScopeId(id) }))
+		.sort((a, b) => a.label.localeCompare(b.label));
+	for (const project of projects) {
+		rows.push({
+			rowId: project.id,
+			label: project.label,
+			locked: false,
+			isOwn: false,
+			staged: state.staged.includes(project.id),
+		});
+	}
+
+	if (state.ownScope !== "global" && state.known.includes("global") && state.globalExists) {
+		rows.push({
+			rowId: "global",
+			label: "global",
+			locked: false,
+			isOwn: false,
+			staged: state.staged.includes("global"),
+		});
+	}
+
+	rows.push({
+		rowId: MEMORY_PANEL_STATUS_ROW_ID,
+		label: "Status",
+		locked: false,
+		isOwn: false,
+		staged: false,
+		action: "status",
+	});
+	rows.push({
+		rowId: MEMORY_PANEL_MIGRATE_ROW_ID,
+		label: "Migrate",
+		locked: false,
+		isOwn: false,
+		staged: false,
+		action: "migrate",
+	});
+	return rows;
+}
+
+/**
+ * Flip a row's staged membership. The own scope, action rows and rows that do
+ * not exist are ignored. Staged extras keep row order, so applying is
+ * deterministic.
+ */
+export function toggleMemoryPanelRow(state: MemoryPanelState, rowId: string): MemoryPanelState {
+	const row = buildMemoryPanelRows(state).find((candidate) => candidate.rowId === rowId);
+	if (!row || row.locked || row.action) return state;
+	const staged = row.staged
+		? state.staged.filter((id) => id !== rowId)
+		: state.staged.filter((id) => id !== rowId).concat(rowId);
+	return { ...state, staged };
+}
+
+/**
+ * Enter on a scope row: apply the staged set. Extras come out in row order,
+ * which keeps the resulting set order stable regardless of toggle order.
+ * Enter on the Status row asks to expand or collapse its header block.
+ * Enter on the Migrate row: decide notify vs confirm from a fresh preview.
+ */
+function migratePanelAction(migration: MemoryPanelMigration): MemoryPanelMigrateAction {
+	if (migration.kind === "refused") {
+		return { kind: "migrate", refusal: migration.message, plan: null, nothingToMigrate: false, summary: "" };
+	}
+	if (migration.plan.alreadyMigrated) {
+		return { kind: "migrate", refusal: null, plan: migration.plan, nothingToMigrate: true, summary: "" };
+	}
+	return {
+		kind: "migrate",
+		refusal: null,
+		plan: migration.plan,
+		nothingToMigrate: false,
+		summary: formatMigratePlan(migration.plan),
+	};
+}
+
+export function activateMemoryPanelRow(
+	state: MemoryPanelState,
+	rowId: string,
+	migration?: MemoryPanelMigration,
+): MemoryPanelAction {
+	const rows = buildMemoryPanelRows(state);
+	const row = rows.find((candidate) => candidate.rowId === rowId);
+	if (!row) return { kind: "none" };
+	if (row.action === "status") return { kind: "status", expanded: !state.statusExpanded };
+	if (row.action === "migrate") return migration ? migratePanelAction(migration) : { kind: "none" };
+	const extraScopes = rows
+		.filter((candidate) => !candidate.isOwn && candidate.staged)
+		.map((candidate) => candidate.rowId);
+	return { kind: "apply", extraScopes };
+}
+
+/**
+ * One-line confirmation of the applied set, rendered under the refreshed
+ * header after a successful apply (spec: header plus a summary line).
+ */
+export function buildMemoryPanelSummary(state: MemoryPanelState): string {
+	const scopes = buildMemoryPanelRows(state)
+		.filter((row) => row.staged && !row.action)
+		.map((row) => `${row.label}${row.isOwn ? " (own)" : ""}`);
+	return `Applied: ${scopes.join(", ")}`;
+}
+
+/** Per-scope directories, computed without qmd, for the block while the probe runs. */
+function panelStatusScopeRows(
+	ownScope: string,
+	activeScopes: readonly string[],
+	memoryRoot: string,
+): MemoryStatusScopeRow[] {
+	const isOwn = panelOwnIdMatcher(ownScope);
+	return activeScopes.map((id) => {
+		let info: ScopeDirInfo | null = null;
+		try {
+			info = resolveScopeDirectory(memoryRoot, id);
+		} catch {
+			// Ambiguous display id: nothing safe to show, but never break the panel.
+		}
+		const dir = info?.dir ?? scopeDirPath(memoryRoot, id) ?? "?";
+		return {
+			id: displayScopeId(info?.id ?? id),
+			own: isOwn(id),
+			dir,
+			dirExists: dir !== "?" && fs.existsSync(dir),
+			collection: null,
+			collectionState: "unchecked",
+		};
+	});
+}
+
+/**
+ * Header: one line with the active scope set (own marked) and the memory root,
+ * rebuilt from the applied set on every render. Labels reuse the shared
+ * ambiguity rule, so two active same-slug scopes stay distinguishable. When the
+ * status block is supplied (Status expanded), each active scope's directory
+ * follows immediately; qmd readiness lands with the snapshot.
+ */
+export function buildMemoryPanelHeader(
+	ownScope: string,
+	activeScopes: readonly string[],
+	memoryRoot: string,
+	statusBlock?: MemoryPanelStatusBlock | null,
+): string {
+	const labels = ambiguousLabels(activeScopes);
+	const isOwn = panelOwnIdMatcher(ownScope);
+	const scopes = activeScopes
+		.map((id) => {
+			const label = labels.get(id) ?? displayScopeId(id);
+			return isOwn(id) ? `${label} (own)` : label;
+		})
+		.join(", ");
+	const lines = [`Scopes: ${scopes} · Root: ${memoryRoot}`];
+	if (statusBlock) {
+		const mark = (ok: boolean) => (ok ? "✓" : "✗");
+		const rows =
+			statusBlock.kind === "ready"
+				? statusBlock.snapshot.scopes
+				: panelStatusScopeRows(ownScope, activeScopes, memoryRoot);
+		lines.push("Status:");
+		for (const scope of rows) {
+			lines.push(
+				`- ${scope.id}${scope.own ? " (own)" : ""}: ${scope.dir} — ${scope.dirExists ? "exists ✓" : "missing ✗"}`,
+			);
+		}
+		if (statusBlock.kind === "pending") {
+			const frame = STATUS_SPINNER_FRAMES[(statusBlock.frame ?? 0) % STATUS_SPINNER_FRAMES.length];
+			lines.push(`- qmd: ${frame} checking`);
+		} else if (statusBlock.kind === "error") {
+			lines.push(`- qmd: ✗ status unavailable: ${statusBlock.message}`);
+		} else if (statusBlock.snapshot.qmdAvailable) {
+			lines.push(
+				`- qmd: ✓ available, collection \`${GLOBAL_COLLECTION_NAME}\`: ${mark(statusBlock.snapshot.collectionAvailable)}, embeddings: ${statusBlock.snapshot.embeddings}`,
+			);
+		} else {
+			lines.push("- qmd: ✗ unavailable");
+		}
+	}
+	return lines.join("\n");
+}
+
+/** The own scope id qualified with its hash when the directory exists, for exact row addressing. */
+function panelOwnScopeId(): string {
+	if (ownScopeId === "global") return "global";
+	const known = listKnownScopes(memoryRoot);
+	const ownDir = path.resolve(MEMORY_DIR);
+	const matched = known.find((id) => {
+		const dir = scopeDirPath(memoryRoot, id);
+		return dir !== null && path.resolve(dir) === ownDir;
+	});
+	if (matched) return matched;
+	const ownDisplay = displayScopeId(ownScopeId);
+	const candidates = known.filter((id) => displayScopeId(id) === ownDisplay);
+	return candidates.length === 1 ? candidates[0] : ownScopeId;
+}
+
+function currentPanelState(): MemoryPanelState {
+	return createMemoryPanelState(
+		panelOwnScopeId(),
+		listKnownScopes(memoryRoot),
+		activeScopeSet,
+		fs.existsSync(path.join(memoryRoot, "global")),
+	);
+}
+
+/** Fresh Migrate preview: the installed-extension refusal first, then the existing planner. */
+async function buildMemoryPanelMigration(): Promise<MemoryPanelMigration> {
+	const refusal = memoryScopeRefusal();
+	if (refusal) return { kind: "refused", message: refusal };
+	const qmdAvailable = await detectQmd();
+	const input: MigratePlanInput = {
+		memoryRoot,
+		qmdAvailable,
+		collections: qmdAvailable ? await readMigrationCollections(memoryRoot) : {},
+	};
+	return { kind: "planned", plan: planMemoryMigration(input) };
+}
+
+interface MemoryPanelActions {
+	/** Apply the staged extras; returns an error message when the apply failed. */
+	apply: (extraScopes: string[]) => string | null;
+	/** Rebuild the list state from the applied set after a successful apply. */
+	freshState: () => MemoryPanelState;
+	/** Header rebuilt from the applied set and, when expanded, the current status block. */
+	header: (ownScope: string, statusBlock: MemoryPanelStatusBlock | null) => string;
+	/** Gather the same status data the memory_status tool reports. */
+	status: () => Promise<MemoryStatusSnapshot>;
+	/** Fresh migration preview from the existing planner, or the installed-extension refusal. */
+	migratePreview: () => Promise<MemoryPanelMigration>;
+	/** Confirmation gate before a migration changes anything. */
+	confirmMigrate: (summary: string) => Promise<boolean>;
+	/** Apply through the existing command path; returns the failure text or null. */
+	applyMigrate: () => Promise<string | null>;
+	notify: (message: string, type?: "info" | "warning" | "error") => void;
+	close: () => void;
+}
+
+/**
+ * Flat panel over the list state: arrows move through pi's SelectList, space
+ * and tab toggle the highlighted scope, enter applies or expands Status, esc
+ * closes. The list is rebuilt on every state change (SelectList has no
+ * set-items API) and the highlighted row is restored by index.
+ */
+class MemoryPanelView implements Component {
+	private list: SelectList;
+	private state: MemoryPanelState;
+	private statusBlock: MemoryPanelStatusBlock | null = null;
+	private statusRequest = 0;
+	private spinFrame = 0;
+	private spinTimer: ReturnType<typeof setInterval> | null = null;
+	private selectedIndex = 0;
+	/** Last successful apply, shown as a summary line under the header. */
+	private summary: string | null = null;
+	private readonly theme: Theme;
+	private readonly actions: MemoryPanelActions;
+	private readonly requestRender: () => void;
+
+	constructor(theme: Theme, state: MemoryPanelState, actions: MemoryPanelActions, requestRender: () => void) {
+		this.theme = theme;
+		this.state = state;
+		this.actions = actions;
+		this.requestRender = requestRender;
+		this.list = this.buildList();
+	}
+
+	private selectListTheme(): SelectListTheme {
+		return {
+			selectedPrefix: (text) => this.theme.fg("accent", text),
+			selectedText: (text) => this.theme.fg("accent", text),
+			description: (text) => this.theme.fg("muted", text),
+			scrollInfo: (text) => this.theme.fg("dim", text),
+			noMatch: (text) => this.theme.fg("dim", text),
+		};
+	}
+
+	private buildList(): SelectList {
+		const items = buildMemoryPanelRows(this.state).map((row) => {
+			if (row.action === "status") {
+				return {
+					value: row.rowId,
+					label: `${row.label}${this.state.statusExpanded ? " (expanded)" : ""}`,
+					description: this.state.statusExpanded ? "enter to collapse" : "enter to show paths and qmd readiness",
+				};
+			}
+			if (row.action === "migrate") {
+				return {
+					value: row.rowId,
+					label: row.label,
+					description: "plan and apply the scope layout migration",
+				};
+			}
+			return {
+				value: row.rowId,
+				label: `${row.staged ? "[x]" : "[ ]"} ${row.label}${row.isOwn ? " (own)" : ""}`,
+				description: row.locked ? "locked: this session's scope" : undefined,
+			};
+		});
+		const list = new SelectList(items, 10, this.selectListTheme());
+		list.setSelectedIndex(this.selectedIndex);
+		list.onSelect = (item) => {
+			void this.activate(item.value);
+		};
+		list.onCancel = () => {
+			this.stopSpin();
+			this.actions.close();
+		};
+		list.onSelectionChange = (item) => {
+			const index = items.findIndex((candidate) => candidate.value === item.value);
+			if (index >= 0) this.selectedIndex = index;
+		};
+		return list;
+	}
+
+	private rebuild() {
+		this.list = this.buildList();
+	}
+
+	private toggle(rowId: string) {
+		const next = toggleMemoryPanelRow(this.state, rowId);
+		if (next === this.state) return;
+		this.state = next;
+		this.rebuild();
+	}
+
+	/** Tick the braille spinner while a probe is pending, matching pi's Loader cadence. */
+	private startSpin() {
+		this.spinFrame = 0;
+		if (this.spinTimer !== null) return;
+		this.spinTimer = setInterval(() => {
+			if (this.statusBlock?.kind !== "pending") return;
+			this.spinFrame++;
+			this.statusBlock = { kind: "pending", frame: this.spinFrame };
+			this.requestRender();
+		}, STATUS_SPINNER_INTERVAL_MS);
+	}
+
+	private stopSpin() {
+		if (this.spinTimer !== null) clearInterval(this.spinTimer);
+		this.spinTimer = null;
+	}
+
+	/**
+	 * Fetch status data off the input path. The block paints as pending first so
+	 * expanding Status is visibly instant, and the qmd line spins until the
+	 * snapshot lands; a failed probe reports itself instead of leaving the block
+	 * blank.
+	 */
+	private async loadStatus() {
+		const request = ++this.statusRequest;
+		this.startSpin();
+		this.statusBlock = { kind: "pending" };
+		this.requestRender();
+		try {
+			const snapshot = await this.actions.status();
+			if (request !== this.statusRequest || !this.state.statusExpanded) return;
+			this.statusBlock = { kind: "ready", snapshot };
+		} catch (err) {
+			if (request !== this.statusRequest || !this.state.statusExpanded) return;
+			this.statusBlock = { kind: "error", message: err instanceof Error ? err.message : String(err) };
+		}
+		this.stopSpin();
+		this.requestRender();
+	}
+
+	private async activate(rowId: string) {
+		if (rowId === MEMORY_PANEL_MIGRATE_ROW_ID) {
+			const action = activateMemoryPanelRow(this.state, rowId, await this.actions.migratePreview());
+			if (action.kind === "migrate") await this.runMigrate(action);
+			return;
+		}
+		const action = activateMemoryPanelRow(this.state, rowId);
+		if (action.kind === "none") return;
+		if (action.kind === "status") {
+			this.state = { ...this.state, statusExpanded: action.expanded };
+			if (!action.expanded) {
+				const wasPending = this.statusBlock?.kind === "pending";
+				// Drop the in-flight probe so a late result cannot reopen the block.
+				this.statusRequest++;
+				this.statusBlock = null;
+				this.stopSpin();
+				if (wasPending) this.actions.notify("status check canceled");
+			}
+			this.rebuild();
+			if (action.expanded) void this.loadStatus();
+			return;
+		}
+		if (action.kind !== "apply") return;
+		const wasExpanded = this.state.statusExpanded;
+		const error = this.actions.apply(action.extraScopes);
+		if (error) {
+			this.actions.notify(error, "error");
+			return;
+		}
+		this.state = { ...this.actions.freshState(), statusExpanded: wasExpanded };
+		this.summary = buildMemoryPanelSummary(this.state);
+		this.rebuild();
+		// The block describes the applied set, so refresh it when the apply changed it.
+		if (wasExpanded) void this.loadStatus();
+	}
+
+	/** Refusal and empty plans only notify; a real plan is confirmed before it applies. */
+	private async runMigrate(action: MemoryPanelMigrateAction) {
+		if (action.refusal) {
+			this.actions.notify(action.refusal, "warning");
+			return;
+		}
+		if (action.nothingToMigrate) {
+			this.actions.notify("nothing to migrate");
+			return;
+		}
+		if (!action.plan) return;
+		const wasExpanded = this.state.statusExpanded;
+		if (!(await this.actions.confirmMigrate(action.summary))) return;
+		let error: string | null;
+		try {
+			error = await this.actions.applyMigrate();
+		} catch (err) {
+			error = err instanceof Error ? err.message : String(err);
+		}
+		if (error) {
+			this.actions.notify(error, "error");
+			return;
+		}
+		this.actions.notify("migration applied");
+		// Row membership can change with the layout, so rebuild and refresh the block.
+		this.state = { ...this.actions.freshState(), statusExpanded: wasExpanded };
+		this.rebuild();
+		if (wasExpanded) void this.loadStatus();
+	}
+
+	handleInput(data: string): void {
+		if (data === " " || data === "\t") {
+			const selected = this.list.getSelectedItem();
+			if (selected) this.toggle(selected.value);
+			return;
+		}
+		this.list.handleInput(data);
+	}
+
+	render(width: number): string[] {
+		const header = this.actions.header(this.state.ownScope, this.state.statusExpanded ? this.statusBlock : null);
+		const lines = this.summary ? [header, this.summary] : [header];
+		return [...lines.join("\n").split("\n"), ...this.list.render(width)];
+	}
+
+	invalidate(): void {
+		this.list.invalidate();
+	}
+}
+
+/** Bare `/memory` in a TUI: the panel writes only the session's command layer. */
+async function openMemoryPanel(ctx: ExtensionCommandContext): Promise<void> {
+	await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
+		return new MemoryPanelView(
+			theme,
+			currentPanelState(),
+			{
+				apply: (extraScopes) => {
+					try {
+						applyScopeSetChange(extraScopes);
+						commandScopes = extraScopes;
+						return null;
+					} catch (err) {
+						return err instanceof Error ? err.message : String(err);
+					}
+				},
+				freshState: currentPanelState,
+				header: (ownScope, statusBlock) =>
+					buildMemoryPanelHeader(ownScope, activeScopeSet, memoryRoot, statusBlock),
+				status: gatherMemoryStatus,
+				migratePreview: buildMemoryPanelMigration,
+				confirmMigrate: (summary) => ctx.ui.confirm("Migrate memory layout?", summary),
+				applyMigrate: async () => {
+					// Keep one apply path: the command re-plans and executes; undo stays CLI-only.
+					const result = await runMemoryMigrate(["--apply"]);
+					return result.code === 0 ? null : result.text;
+				},
+				notify: (message, type) => ctx.ui.notify(message, type),
+				close: () => done(undefined),
+			},
+			() => tui.requestRender(),
+		);
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -2438,6 +3127,17 @@ function defaultExtensionsDir(): string {
 
 function resolveExtensionsDir(): string {
 	return extensionsDirOverride ?? defaultExtensionsDir();
+}
+
+/** Verbatim refusal shared by `/memory migrate` and the panel's Migrate row. */
+function memoryScopeRefusal(): string | null {
+	const memoryScopePath = path.join(resolveExtensionsDir(), "memory-scope.ts");
+	if (!fs.existsSync(memoryScopePath)) return null;
+	return [
+		`refusing to migrate: ${memoryScopePath} still exists.`,
+		"It re-points the pi-memory collection at the current project directory at module load, which would immediately undo the migration.",
+		"Rename that file, then run /reload.",
+	].join("\n");
 }
 
 export type MigrateActionStatus = "pending" | "done" | "skipped" | "failed";
@@ -3032,18 +3732,8 @@ export async function runMemoryMigrate(args: string[]): Promise<{ text: string; 
 	if (parsed.error) return { text: `${parsed.error}\n${MIGRATE_USAGE}`, code: 2 };
 
 	const root = memoryRoot;
-	const extensionsDir = resolveExtensionsDir();
-	const memoryScopePath = path.join(extensionsDir, "memory-scope.ts");
-	if (fs.existsSync(memoryScopePath)) {
-		return {
-			text: [
-				`refusing to migrate: ${memoryScopePath} still exists.`,
-				"It re-points the pi-memory collection at the current project directory at module load, which would immediately undo the migration.",
-				"Rename that file, then run /reload.",
-			].join("\n"),
-			code: 2,
-		};
-	}
+	const refusal = memoryScopeRefusal();
+	if (refusal) return { text: refusal, code: 2 };
 
 	let manifest: MigrationManifest | null = null;
 	if (parsed.undo) {
@@ -3110,6 +3800,12 @@ export default function (pi: ExtensionAPI) {
 			const errorText = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
 			if (tokens.length === 0) {
+				// Bare /memory is the only interactive entry point; everywhere
+				// else (print, JSON, RPC) it keeps printing the plain report.
+				if (ctx.mode === "tui") {
+					await openMemoryPanel(ctx);
+					return;
+				}
 				send(buildScopeReport(projectRoot));
 				return;
 			}
@@ -4186,39 +4882,16 @@ export default function (pi: ExtensionAPI) {
 			ensureDirs();
 			const inv = getMemoryInventory();
 
-			const qmdOk = qmdAvailable || (await detectQmd());
-			let collectionOk = false;
-			let embeddings: "ready" | "missing" | "unknown" | "n/a" = "n/a";
-			let diagnostics: CollectionDiagnostics | null = null;
-			if (qmdOk) {
-				diagnostics = await collectCollectionDiagnostics();
-				collectionOk = diagnostics.scopes.some((scope) => scope.scope === "global" && scope.exists);
-				if (!collectionOk) collectionOk = await checkCollection(GLOBAL_COLLECTION_NAME);
-				embeddings = collectionOk ? await probeEmbeddings() : "n/a";
-			}
+			const status = await gatherMemoryStatus();
+			const {
+				qmdAvailable: qmdOk,
+				collectionAvailable: collectionOk,
+				embeddings,
+				diagnostics,
+				scopes: scopeRows,
+			} = status;
 
 			const mark = (ok: boolean) => (ok ? "✓" : "✗");
-			const ctx = scopeContext();
-			// Per-scope layout needs no qmd: directories and collection names are
-			// computed from the naming rule; collection state is only checked when
-			// qmd is available (never shell out from here).
-			const scopeRows = ctx.activeScopes.map((id) => {
-				const info = scopeInfoForId(id, ctx);
-				const dir = info?.dir ?? scopeDirPath(memoryRoot, id) ?? "?";
-				const collection = collectionNameForScope(id, info?.dir);
-				const diagnostic = diagnostics?.scopes.find((scope) => scope.scope === (info?.id ?? id));
-				const dirExists = diagnostic ? diagnostic.dirExists : dir !== "?" && fs.existsSync(dir);
-				const collectionState: "exists" | "missing" | "unchecked" =
-					!qmdOk || !dirExists || !diagnostic ? "unchecked" : diagnostic.exists ? "exists" : "missing";
-				return {
-					id: displayScopeId(info?.id ?? id),
-					own: id === ctx.ownScope,
-					dir,
-					dirExists,
-					collection,
-					collectionState,
-				};
-			});
 			const scopeMark = (state: "exists" | "missing" | "unchecked") =>
 				state === "exists" ? "✓" : state === "missing" ? "✗" : "—";
 			const lines: string[] = [
