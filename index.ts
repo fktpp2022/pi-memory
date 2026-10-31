@@ -35,10 +35,13 @@ import { complete } from "@earendil-works/pi-ai/compat";
 import {
 	convertToLlm,
 	type ExtensionAPI,
+	type ExtensionCommandContext,
 	type ExtensionContext,
 	type SessionEntry,
 	serializeConversation,
+	type Theme,
 } from "@earendil-works/pi-coding-agent";
+import { type Component, SelectList, type SelectListTheme } from "@earendil-works/pi-tui";
 
 // ---------------------------------------------------------------------------
 // Paths (mutable for testing via _setBaseDir / _resetBaseDir)
@@ -60,6 +63,25 @@ export function resolveMemoryDir(env: MemoryEnv = process.env): string {
 	return path.join(home, ".pi", "agent", "memory");
 }
 
+/**
+ * Spec §8.4: `PI_MEMORY_DIR` is the memory root (the directory holding
+ * `global/` and `projects/`), not a single scope. A directory that contains
+ * `MEMORY.md` directly is scope-shaped — the old memory-scope extension's
+ * layout — so it is warned about, but still honoured as an override.
+ *
+ * Returns `null` when the variable is unset or the directory is root-shaped
+ * (including a missing or empty directory).
+ */
+export function memoryDirWarning(dir: string | undefined = process.env.PI_MEMORY_DIR): string | null {
+	if (!dir) return null;
+	if (!fs.existsSync(path.join(dir, "MEMORY.md"))) return null;
+	return (
+		`PI_MEMORY_DIR is set to "${dir}", which contains MEMORY.md directly: this looks like a memory scope ` +
+		"directory. PI_MEMORY_DIR now points at the memory root (the directory holding global/ and projects/). " +
+		"Point it at the parent root, or run /memory migrate."
+	);
+}
+
 let MEMORY_DIR = resolveMemoryDir();
 let MEMORY_FILE = path.join(MEMORY_DIR, "MEMORY.md");
 let SCRATCHPAD_FILE = path.join(MEMORY_DIR, "SCRATCHPAD.md");
@@ -72,6 +94,25 @@ let memoryRoot = MEMORY_DIR;
 let ownScopeId = "global";
 let ownScopeDirOverride: string | null = null;
 let activeScopeSet: string[] = ["global"];
+
+// Session-only `/memory scope` override. It is never persisted; the durable
+// record is `.pi/memory.json`. session_start clears it.
+let commandScopes: string[] | null = null;
+
+// `ctx.isProjectTrusted()` captured at session_start, so /memory's report
+// resolves the config layer under the same trust decision as the session.
+let sessionTrusted: boolean | undefined;
+
+// Spec §3.2: an env layer naming an unknown scope id is ignored entirely and
+// warned about once at session_start.
+let scopeEnvWarning: string | null = null;
+
+// Spec §8.4: the PI_MEMORY_DIR misconfiguration warning is emitted at most
+// once per session. The session id keys the guard, so a fresh session_start
+// re-arms it while a repeat emit for the same session stays silent. `undefined`
+// is the unset sentinel so a context without a session manager (session id
+// `null`) still differs on the first comparison.
+let memoryDirWarnedSession: string | null | undefined;
 
 function defaultOwnScopeDir(): string {
 	const parsed = parseScopeId(ownScopeId);
@@ -93,15 +134,49 @@ function applyOwnScope(scopeId: string, dir: string | null) {
 	syncOwnScopePaths();
 }
 
-function applySessionScopeSet(projectRoot: string) {
-	const resolved = resolveScopeSet(projectRoot);
+function applySessionScopeSet(projectRoot: string | null, trusted?: boolean) {
+	sessionTrusted = trusted;
+	scopeEnvWarning = null;
+
+	// Outside any repo there is no project scope: the own scope is global,
+	// extras are empty, and there is no project config file (spec §1).
+	const resolved: ResolvedScopeSet =
+		projectRoot === null
+			? { ownScope: "global", extraScopes: [], scopes: ["global"], source: "default" }
+			: resolveScopeSet(projectRoot, { commandScopes: commandScopes ?? undefined, trusted });
+
+	// Validate the extras against the scopes that exist. Unknown ids never
+	// enter the active set, whichever layer supplied them.
+	const known = listKnownScopes(memoryRoot);
+	const extras: string[] = [];
+	const unknown: string[] = [];
+	for (const ref of resolved.extraScopes) {
+		try {
+			const id = resolveScopeReference(ref, known);
+			if (!extras.includes(id)) extras.push(id);
+		} catch {
+			unknown.push(ref);
+		}
+	}
+
+	let activeExtras = extras;
+	if (resolved.source === "env" && unknown.length > 0) {
+		// Spec §3.2: an unknown env id is an error; the env layer is ignored
+		// entirely (extras = empty) and the session continues.
+		scopeEnvWarning =
+			`PI_MEMORY_SCOPES names unknown scope id${unknown.length === 1 ? "" : "s"} ` +
+			`${unknown.map((id) => `"${id}"`).join(", ")}; known scopes: ${known.join(", ")}. ` +
+			"Ignoring PI_MEMORY_SCOPES for this session.";
+		activeExtras = [];
+	}
+
 	const parsed = parseScopeId(resolved.ownScope);
 	const ownDir =
 		parsed && parsed.kind === "project"
-			? path.join(memoryRoot, "projects", scopeDirName(parsed.slug as string, scopeHash(projectRoot)))
+			? path.join(memoryRoot, "projects", scopeDirName(parsed.slug as string, scopeHash(projectRoot as string)))
 			: path.join(memoryRoot, "global");
 	applyOwnScope(resolved.ownScope, ownDir);
-	activeScopeSet = [...resolved.scopes];
+	activeScopeSet = [resolved.ownScope, ...activeExtras];
 }
 
 /** Override base directory (for testing); this is the own scope's directory. */
@@ -116,6 +191,9 @@ export function _resetBaseDir() {
 	memoryRoot = resolveMemoryDir();
 	applyOwnScope("global", null);
 	activeScopeSet = ["global"];
+	memoryDirWarnedSession = undefined;
+	sessionTrusted = undefined;
+	scopeEnvWarning = null;
 }
 
 /** Point at a memory root (the directory holding global/ and projects/) for testing. */
@@ -243,6 +321,13 @@ export function projectScopeId(slug: string, _hash?: string): string {
 	return `project:${slug}`;
 }
 
+/** Display form of any known id: strips the hash, which is an addressing detail. */
+export function displayScopeId(id: string): string {
+	const parsed = parseScopeId(id);
+	if (!parsed || parsed.kind === "global") return id;
+	return projectScopeId(parsed.slug as string);
+}
+
 export function scopeDirName(slug: string, hash: string): string {
 	return `${slug}-${hash}`;
 }
@@ -254,11 +339,11 @@ export function deriveOwnScope(projectRoot: string, slugOverride?: string): { sl
 }
 
 /**
- * Scope identity is anchored to the project root: the git root, else the cwd.
- * A session started in a subdirectory belongs to the repository's scope, not
- * to a scope of its own.
+ * Project root for a session: the git root, else `null` — outside any repo
+ * there is no project scope (spec §1). A session started in a subdirectory
+ * belongs to the repository's scope, not to a scope of its own.
  */
-export function projectRootFor(cwd: string): string {
+export function projectRootFor(cwd: string): string | null {
 	try {
 		// GIT_DIR/GIT_WORK_TREE are inherited from git hooks and would override -C.
 		const env = { ...process.env };
@@ -269,9 +354,9 @@ export function projectRootFor(cwd: string): string {
 			stdio: ["ignore", "pipe", "ignore"],
 			env,
 		}).trim();
-		return out ? path.resolve(out) : path.resolve(cwd);
+		return out ? path.resolve(out) : null;
 	} catch {
-		return path.resolve(cwd);
+		return null;
 	}
 }
 
@@ -1192,76 +1277,171 @@ function readRecoveryRecord(recoveryId: string): { record: RecoveryRecord; fileP
 // Context builder
 // ---------------------------------------------------------------------------
 
-export function buildMemoryContext(searchResults?: string): string {
-	ensureDirs();
-	// Priority order: scratchpad > today's daily > search results > MEMORY.md > yesterday's daily
-	const sections: string[] = [];
+interface ScopeContentSection {
+	label: string;
+	content: string;
+	mode: TruncateMode;
+	maxLines: number;
+	maxChars: number;
+	rendered: string;
+}
 
-	const scratchpad = readFileSafe(SCRATCHPAD_FILE);
+/** Active scope directories, own scope first, de-duplicated by directory. */
+function activeScopeDirs(): Array<{ id: string; dir: string }> {
+	const ctx = scopeContext();
+	// Spec §5.1: own scope first, then the extra project scopes in set order,
+	// then `global` last — regardless of where the set lists it.
+	const extras = activeScopeSet.filter((id) => id !== ownScopeId);
+	const ordered = [ownScopeId, ...extras.filter((id) => id !== "global")];
+	if (extras.includes("global")) ordered.push("global");
+	const entries: Array<{ id: string; dir: string }> = [];
+	for (const id of ordered) {
+		const info = scopeInfoForId(id, ctx);
+		if (!info) continue;
+		if (entries.some((entry) => entry.dir === info.dir)) continue;
+		entries.push({ id: displayScopeId(id), dir: info.dir });
+	}
+	return entries;
+}
+
+function buildScopeSection(
+	label: string,
+	content: string,
+	mode: TruncateMode,
+	maxLines: number,
+	maxChars: number,
+): ScopeContentSection | null {
+	const rendered = formatContextSection(label, content, mode, maxLines, maxChars);
+	if (!rendered) return null;
+	return { label, content, mode, maxLines, maxChars, rendered };
+}
+
+/** One scope's files in injected order: scratchpad > today > long-term > yesterday. */
+function collectScopeSections(dir: string): ScopeContentSection[] {
+	const sections: ScopeContentSection[] = [];
+	const push = (section: ScopeContentSection | null) => {
+		if (section) sections.push(section);
+	};
+
+	const scratchpad = readFileSafe(path.join(dir, "SCRATCHPAD.md"));
 	if (scratchpad?.trim()) {
-		const openItems = parseScratchpad(scratchpad).filter((i) => !i.done);
+		const openItems = parseScratchpad(scratchpad).filter((item) => !item.done);
 		if (openItems.length > 0) {
-			const serialized = serializeScratchpad(openItems);
-			const section = formatContextSection(
-				"## SCRATCHPAD.md (working context)",
-				serialized,
-				"start",
-				CONTEXT_SCRATCHPAD_MAX_LINES,
-				CONTEXT_SCRATCHPAD_MAX_CHARS,
+			push(
+				buildScopeSection(
+					"### SCRATCHPAD.md (working context)",
+					serializeScratchpad(openItems),
+					"start",
+					CONTEXT_SCRATCHPAD_MAX_LINES,
+					CONTEXT_SCRATCHPAD_MAX_CHARS,
+				),
 			);
-			if (section) sections.push(section);
 		}
 	}
 
 	const today = todayStr();
-	const yesterday = yesterdayStr();
-
-	const todayContent = readFileSafe(dailyPath(today));
-	if (todayContent?.trim()) {
-		const section = formatContextSection(
-			`## Daily log: ${today} (today)`,
-			todayContent,
+	push(
+		buildScopeSection(
+			`### Daily log: ${today} (today)`,
+			readFileSafe(dailyPathIn(dir, today)) ?? "",
 			"end",
 			CONTEXT_DAILY_MAX_LINES,
 			CONTEXT_DAILY_MAX_CHARS,
-		);
-		if (section) sections.push(section);
-	}
+		),
+	);
 
-	if (searchResults?.trim()) {
-		const section = formatContextSection(
-			"## Relevant memories (auto-retrieved)",
-			searchResults,
-			"start",
-			CONTEXT_SEARCH_MAX_LINES,
-			CONTEXT_SEARCH_MAX_CHARS,
-		);
-		if (section) sections.push(section);
-	}
-
-	const longTerm = readFileSafe(MEMORY_FILE);
-	if (longTerm?.trim()) {
-		const section = formatContextSection(
-			"## MEMORY.md (long-term)",
-			longTerm,
+	push(
+		buildScopeSection(
+			"### MEMORY.md (long-term)",
+			readFileSafe(path.join(dir, "MEMORY.md")) ?? "",
 			"middle",
 			CONTEXT_LONG_TERM_MAX_LINES,
 			CONTEXT_LONG_TERM_MAX_CHARS,
-		);
-		if (section) sections.push(section);
-	}
+		),
+	);
 
-	const yesterdayContent = readFileSafe(dailyPath(yesterday));
-	if (yesterdayContent?.trim()) {
-		const section = formatContextSection(
-			`## Daily log: ${yesterday} (yesterday)`,
-			yesterdayContent,
+	const yesterday = yesterdayStr();
+	push(
+		buildScopeSection(
+			`### Daily log: ${yesterday} (yesterday)`,
+			readFileSafe(dailyPathIn(dir, yesterday)) ?? "",
 			"end",
 			CONTEXT_DAILY_MAX_LINES,
 			CONTEXT_DAILY_MAX_CHARS,
-		);
-		if (section) sections.push(section);
+		),
+	);
+
+	return sections;
+}
+
+/** Shrink a section's content to fit a char budget, keeping its heading. */
+function shrinkSectionTo(section: ScopeContentSection, budget: number): string {
+	const contentBudget = budget - section.label.length - 2;
+	if (contentBudget <= 0) return "";
+	const result = buildPreview(section.content, {
+		maxLines: Number.POSITIVE_INFINITY,
+		maxChars: contentBudget,
+		mode: section.mode,
+	});
+	if (!result.preview) return "";
+	return `${section.label}\n\n${result.preview}`;
+}
+
+/**
+ * Render one `## Scope: <id>` block within its share of the budget. Sections
+ * are dropped from the lowest-priority end (yesterday, long-term, today) until
+ * the block fits; the working context is truncated last, so no scope vanishes.
+ */
+function renderScopeBlock(id: string, dir: string, share: number): string {
+	const sections = collectScopeSections(dir);
+	if (sections.length === 0) return "";
+
+	const join = (items: ScopeContentSection[]) => items.map((item) => item.rendered).join("\n\n");
+	const totalChars = join(sections).length;
+	let kept = sections;
+	let body = join(kept);
+	let truncated = false;
+
+	while (body.length > share && kept.length > 1) {
+		kept = kept.slice(0, -1);
+		body = join(kept);
+		truncated = true;
 	}
+	if (body.length > share && kept.length === 1) {
+		const shrunk = shrinkSectionTo(kept[0], share);
+		if (shrunk) {
+			kept = [{ ...kept[0], rendered: shrunk }];
+			body = shrunk;
+			truncated = true;
+		}
+	}
+
+	const marker = truncated ? `\n\n[truncated: showing ${body.length}/${totalChars} chars of scope ${id}]` : "";
+	return `## Scope: ${id}\n\n${body}${marker}`;
+}
+
+export function buildMemoryContext(searchResults?: string): string {
+	ensureDirs();
+
+	const searchSection = searchResults?.trim()
+		? formatContextSection(
+				"## Relevant memories (auto-retrieved)",
+				searchResults,
+				"start",
+				CONTEXT_SEARCH_MAX_LINES,
+				CONTEXT_SEARCH_MAX_CHARS,
+			)
+		: "";
+
+	// The search section keeps its cap; the remainder is split equally among the
+	// scopes, and an absent search section redistributes its share. A scope with
+	// no content still reserves its share: no scope is ever dropped.
+	const scopes = activeScopeDirs();
+	const searchReserve = searchSection ? CONTEXT_SEARCH_MAX_CHARS : 0;
+	const scopeShare = scopes.length > 0 ? Math.floor((CONTEXT_MAX_CHARS - searchReserve) / scopes.length) : 0;
+
+	const blocks = scopes.map((scope) => renderScopeBlock(scope.id, scope.dir, scopeShare)).filter(Boolean);
+	const sections = [...blocks, searchSection].filter(Boolean);
 
 	if (sections.length === 0) {
 		return "";
@@ -1691,6 +1871,82 @@ export async function collectCollectionDiagnostics(ctx: ScopeContext = scopeCont
 	return { scopes, orphans, orphanChunks: await probeOrphanedChunks() };
 }
 
+export interface MemoryStatusScopeRow {
+	id: string;
+	own: boolean;
+	dir: string;
+	dirExists: boolean;
+	collection: string | null;
+	collectionState: "exists" | "missing" | "unchecked";
+}
+
+export interface MemoryStatusSnapshot {
+	qmdAvailable: boolean;
+	collectionAvailable: boolean;
+	embeddings: "ready" | "missing" | "unknown" | "n/a";
+	scopes: MemoryStatusScopeRow[];
+	diagnostics: CollectionDiagnostics | null;
+}
+
+/**
+ * The panel's header block: `pending` while the probe runs, so the directories
+ * paint immediately and the qmd line spins as a visible background operation;
+ * `error` when the probe fails, so an expanded Status never looks like a no-op.
+ */
+export type MemoryPanelStatusBlock =
+	| { kind: "pending"; frame?: number }
+	| { kind: "ready"; snapshot: MemoryStatusSnapshot }
+	| { kind: "error"; message: string };
+
+/** Braille spinner matching pi's Loader defaults: 80 ms per frame. */
+const STATUS_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const STATUS_SPINNER_INTERVAL_MS = 80;
+
+/**
+ * Shared status gathering for the `memory_status` tool and the /memory panel:
+ * one place for qmd detection, per-scope collection state and the global
+ * collection/embeddings readiness. It owns its precondition — the own scope's
+ * directories exist — so every caller reports the same layout. Callers format
+ * the result themselves.
+ */
+export async function gatherMemoryStatus(): Promise<MemoryStatusSnapshot> {
+	ensureDirs();
+	const qmdOk = qmdAvailable || (await detectQmd());
+	let collectionOk = false;
+	let embeddings: MemoryStatusSnapshot["embeddings"] = "n/a";
+	let diagnostics: CollectionDiagnostics | null = null;
+	if (qmdOk) {
+		diagnostics = await collectCollectionDiagnostics();
+		collectionOk = diagnostics.scopes.some((scope) => scope.scope === "global" && scope.exists);
+		if (!collectionOk) collectionOk = await checkCollection(GLOBAL_COLLECTION_NAME);
+		embeddings = collectionOk ? await probeEmbeddings() : "n/a";
+	}
+
+	const ctx = scopeContext();
+	// Per-scope layout needs no qmd: directories and collection names are
+	// computed from the naming rule; collection state is only checked when
+	// qmd is available (never shell out from here).
+	const scopes = ctx.activeScopes.map((id) => {
+		const info = scopeInfoForId(id, ctx);
+		const dir = info?.dir ?? scopeDirPath(memoryRoot, id) ?? "?";
+		const collection = collectionNameForScope(id, info?.dir);
+		const diagnostic = diagnostics?.scopes.find((scope) => scope.scope === (info?.id ?? id));
+		const dirExists = diagnostic ? diagnostic.dirExists : dir !== "?" && fs.existsSync(dir);
+		const collectionState: "exists" | "missing" | "unchecked" =
+			!qmdOk || !dirExists || !diagnostic ? "unchecked" : diagnostic.exists ? "exists" : "missing";
+		return {
+			id: displayScopeId(info?.id ?? id),
+			own: id === ctx.ownScope,
+			dir,
+			dirExists,
+			collection,
+			collectionState,
+		};
+	});
+
+	return { qmdAvailable: qmdOk, collectionAvailable: collectionOk, embeddings, scopes, diagnostics };
+}
+
 export function detectQmd(): Promise<boolean> {
 	const now = Date.now();
 	if (qmdAvailabilityCheckedAt && now - qmdAvailabilityCheckedAt < qmdStatusTtl(qmdAvailable)) {
@@ -1773,7 +2029,54 @@ async function runQmdUpdateNow() {
 	// embed; not chained here so shutdown stays fast.
 }
 
-/** Search for memories relevant to the user's prompt. Returns formatted markdown or empty string on error. */
+const RELEVANT_MEMORIES_LIMIT = 3;
+
+function formatSearchHit(result: QmdSearchResult, scopeId: string): string {
+	const text = getQmdResultText(result);
+	if (!text.trim()) return "";
+	const filePath = getQmdResultPath(result);
+	const filePart = filePath ? `_${filePath}_\n` : "";
+	return `[${scopeId}] ${filePart}${text.trim()}`;
+}
+
+/** One `memory_search` hit block; numbering restarts per scope group. */
+function formatSearchResult(result: QmdSearchResult, index: number): string {
+	const parts: string[] = [`### Result ${index + 1}`];
+	const filePath = getQmdResultPath(result);
+	if (filePath) parts.push(`**File:** ${filePath}`);
+	if (result.score != null) parts.push(`**Score:** ${result.score}`);
+	const text = getQmdResultText(result);
+	if (text) parts.push(`\n${text}`);
+	return parts.join("\n");
+}
+
+/**
+ * Round-robin merge over per-scope hit lists in scope order: each scope
+ * contributes its next-best hit in turn until `limit` is reached. Each
+ * scope's internal order stays score-ranked.
+ */
+function mergeRoundRobin<T>(perScope: T[][], limit: number): T[] {
+	const merged: T[] = [];
+	for (let pass = 0; merged.length < limit; pass++) {
+		let added = false;
+		for (const hits of perScope) {
+			if (pass >= hits.length) continue;
+			merged.push(hits[pass]);
+			added = true;
+			if (merged.length >= limit) break;
+		}
+		if (!added) break;
+	}
+	return merged;
+}
+
+/**
+ * Search every active scope separately and merge round-robin in set order.
+ * A single union search applies its limit globally after the merge, so one
+ * noisy scope could take every slot; round-robin guarantees each scope's best
+ * hit lands as long as there are slots. Returns formatted markdown, or an
+ * empty string on error.
+ */
 export async function searchRelevantMemories(prompt: string): Promise<string> {
 	if (!qmdAvailable || !prompt.trim()) return "";
 
@@ -1787,30 +2090,39 @@ export async function searchRelevantMemories(prompt: string): Promise<string> {
 
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
-		const hasCollection = await checkCollection("pi-memory");
-		if (!hasCollection) return "";
+		// Only scopes whose directory exists and whose collection is usable can
+		// be searched; ensureScopeCollection also creates a missing collection.
+		const searchable: Array<{ id: string; collection: string }> = [];
+		for (const scope of activeScopeDirs()) {
+			if (!fs.existsSync(scope.dir)) continue;
+			const state = await ensureScopeCollection({ id: scope.id, dir: scope.dir });
+			if (state !== "ready" && state !== "created" && state !== "repointed") continue;
+			const collection = collectionNameForScope(scope.id, scope.dir);
+			if (collection) searchable.push({ id: scope.id, collection });
+		}
+		if (searchable.length === 0) return "";
 
 		const results = await Promise.race([
-			runQmdSearch("keyword", sanitized, 3),
+			Promise.all(
+				searchable.map((scope) =>
+					runQmdSearch("keyword", sanitized, RELEVANT_MEMORIES_LIMIT, undefined, scope.collection),
+				),
+			),
 			new Promise<never>((_, reject) => {
 				timer = setTimeout(() => reject(new Error("timeout")), 3_000);
 			}),
 		]);
 
-		if (!results || results.results.length === 0) return "";
+		const perScope = results.map((result, index) =>
+			result.results
+				.map((hit) => formatSearchHit(hit, searchable[index].id))
+				.filter((snippet) => snippet.length > 0),
+		);
 
-		const snippets = results.results
-			.map((r) => {
-				const text = getQmdResultText(r);
-				if (!text.trim()) return null;
-				const filePath = getQmdResultPath(r);
-				const filePart = filePath ? `_${filePath}_` : "";
-				return filePart ? `${filePart}\n${text.trim()}` : text.trim();
-			})
-			.filter(Boolean);
+		const merged = mergeRoundRobin(perScope, RELEVANT_MEMORIES_LIMIT);
 
-		if (snippets.length === 0) return "";
-		return snippets.join("\n\n---\n\n");
+		if (merged.length === 0) return "";
+		return merged.join("\n\n---\n\n");
 	} catch {
 		return "";
 	} finally {
@@ -1877,9 +2189,10 @@ export function runQmdSearch(
 	query: string,
 	limit: number,
 	timeoutOverrideMs?: number,
+	collection: string = GLOBAL_COLLECTION_NAME,
 ): Promise<{ results: QmdSearchResult[]; stderr: string }> {
 	const subcommand = mode === "keyword" ? "search" : mode === "semantic" ? "vsearch" : "query";
-	const args = [subcommand, "--json", "-c", "pi-memory", "-n", String(limit), query];
+	const args = [subcommand, "--json", "-c", collection, "-n", String(limit), query];
 	const timeoutMs = timeoutOverrideMs ?? getQmdSearchTimeoutMs();
 
 	return new Promise((resolve, reject) => {
@@ -2014,6 +2327,719 @@ export function _resetMemorySnapshot() {
 	snapshotDirty = false;
 }
 
+/** Inspect snapshot state (for testing). */
+export function _getSnapshotStateForTest(): { reason: string | null; dirty: boolean; snapshot: string | null } {
+	return { reason: snapshotReason, dirty: snapshotDirty, snapshot: memorySnapshot };
+}
+
+/**
+ * Replace the session's extra scopes mid-session (the `/memory scope` path).
+ * Every ref is resolved before any state changes, so an unknown or ambiguous
+ * id leaves the whole set untouched. The own scope stays first; the own scope
+ * can never appear twice. The config file and MEMORY_DIR are not touched.
+ */
+export function applyScopeSetChange(extraScopes: string[]): void {
+	const known = listKnownScopes(memoryRoot);
+	const resolved: string[] = [];
+	for (const ref of extraScopes) {
+		const id = resolveScopeReference(ref, known);
+		if (id === ownScopeId) continue;
+		const dir = scopeDirPath(memoryRoot, id);
+		if (dir && path.resolve(dir) === path.resolve(MEMORY_DIR)) continue;
+		if (!resolved.includes(id)) resolved.push(id);
+	}
+
+	activeScopeSet = [ownScopeId, ...resolved];
+
+	// Fire-and-forget: collections follow the new set lazily; a scope without a
+	// directory is skipped and no directory is ever created here.
+	void ensureActiveScopeCollections().catch(() => {});
+
+	// §5.4: a set change is a deliberate event. Refresh the frozen snapshot
+	// immediately; in refresh mode mark it stale for the next turn; in per-turn
+	// mode the next turn rebuilds from the new set anyway.
+	const mode = getSnapshotMode();
+	if (mode === "stable") refreshMemorySnapshot("scope_change");
+	else if (mode === "refresh") snapshotDirty = true;
+}
+
+const MEMORY_USAGE =
+	"usage: /memory (report) | /memory scope [<id>...] | /memory scopes | /memory migrate [--apply] [--undo]";
+
+/**
+ * The `/memory` report (spec §3.3): the active set in set order with the own
+ * scope marked, the layer that supplied the extras, and the config file.
+ */
+function buildScopeReport(projectRoot: string | null): string {
+	const resolved = projectRoot
+		? resolveScopeSet(projectRoot, { commandScopes: commandScopes ?? undefined, trusted: sessionTrusted })
+		: null;
+	const own = displayScopeId(ownScopeId);
+	const scopes = activeScopeSet
+		.map((id) => {
+			const display = displayScopeId(id);
+			return display === own ? `${display} (own)` : display;
+		})
+		.join(", ");
+	let config = "(outside a repo — no project config)";
+	if (projectRoot !== null) {
+		const configPath = path.join(projectRoot, ".pi", "memory.json");
+		config = fs.existsSync(configPath) ? configPath : `${configPath} (not found)`;
+	}
+	const lines = [
+		`Scopes: ${scopes}`,
+		`Source: ${commandScopes !== null ? "command" : (resolved?.source ?? "default")}`,
+		`Config: ${config}`,
+	];
+	const dirWarning = memoryDirWarning();
+	if (dirWarning) lines.push(`Warning: ${dirWarning}`);
+	return lines.join("\n");
+}
+
+const MEMORY_VERBS = ["scope", "scopes", "migrate"];
+
+/**
+ * Display labels for a set of ids: a non-global slug shared by two scopes is
+ * hash-qualified, everything else keeps its display form. Shared by the
+ * command completions and the panel so the ambiguity rule lives in one place.
+ */
+function ambiguousLabels(ids: readonly string[]): Map<string, string> {
+	const displayCounts = new Map<string, number>();
+	for (const id of ids) {
+		const display = displayScopeId(id);
+		if (display !== "global") displayCounts.set(display, (displayCounts.get(display) ?? 0) + 1);
+	}
+	const labels = new Map<string, string>();
+	for (const id of ids) {
+		const display = displayScopeId(id);
+		labels.set(id, display !== "global" && (displayCounts.get(display) ?? 0) > 1 ? id : display);
+	}
+	return labels;
+}
+
+/**
+ * Scope ids offered as completions. The display form is used when it is
+ * unambiguous; a bare slug shared by two projects is offered hash-qualified
+ * so the completion can never supply an id the parser would reject.
+ */
+function scopeCompletionIds(): string[] {
+	const known = listKnownScopes(memoryRoot);
+	const labels = ambiguousLabels(known);
+	const ids: string[] = [];
+	for (const id of known) {
+		const value = labels.get(id) ?? displayScopeId(id);
+		if (!ids.includes(value)) ids.push(value);
+	}
+	return ids;
+}
+
+/** Spec §3.3: verbs for the first token, existing scope ids for later ones. */
+function memoryArgumentCompletions(argumentPrefix: string): Array<{ value: string; label: string }> | null {
+	const trimmed = argumentPrefix.trimStart();
+	const firstToken = !/\s/.test(trimmed);
+	const current = firstToken ? trimmed : (trimmed.split(/\s+/).pop() ?? "");
+	const candidates = firstToken ? MEMORY_VERBS : scopeCompletionIds();
+	const matches = candidates.filter((candidate) => candidate.startsWith(current));
+	return matches.length > 0 ? matches.map((value) => ({ value, label: value })) : null;
+}
+
+// ---------------------------------------------------------------------------
+// /memory panel list state (pure; the TUI view is a thin shell over these)
+// ---------------------------------------------------------------------------
+
+/**
+ * Everything the panel needs to decide what a row does. Held as full scope ids
+ * so an ambiguous slug is addressed exactly; `staged` never contains the own
+ * scope, which is locked: never unticked. `globalExists` gates the opt-in
+ * `global` row on the directory actually being on disk.
+ */
+export interface MemoryPanelState {
+	ownScope: string;
+	known: string[];
+	staged: string[];
+	/** Whether the Status block is expanded in the header. */
+	statusExpanded: boolean;
+	/** Whether `<memory root>/global` exists; the own `global` row is unaffected. */
+	globalExists: boolean;
+}
+
+export interface MemoryPanelRow {
+	/** Row identity: a full scope id for scope rows, a sentinel for action rows. */
+	rowId: string;
+	/** Display id, hash-qualified when the bare slug is shared by two projects. */
+	label: string;
+	locked: boolean;
+	isOwn: boolean;
+	staged: boolean;
+	/** Action rows have no scope: enter runs the action instead of applying. */
+	action?: "status" | "migrate";
+}
+
+/** Status row id; scope ids are `global` or `project:...`, so this cannot collide. */
+export const MEMORY_PANEL_STATUS_ROW_ID = "status";
+/** Migrate row id; scope ids are `global` or `project:...`, so this cannot collide. */
+export const MEMORY_PANEL_MIGRATE_ROW_ID = "action:migrate";
+
+/** What the panel knows about migration before the user decides. */
+export type MemoryPanelMigration = { kind: "refused"; message: string } | { kind: "planned"; plan: MigratePlan };
+
+/** Enter on Migrate: notify (refused / nothing) or confirm and apply the plan. */
+export interface MemoryPanelMigrateAction {
+	kind: "migrate";
+	/** Verbatim refusal while the legacy memory-scope.ts is installed; null otherwise. */
+	refusal: string | null;
+	/** Plan to apply; null when refused. */
+	plan: MigratePlan | null;
+	/** No work left: notify "nothing to migrate" instead of confirming. */
+	nothingToMigrate: boolean;
+	/** Confirmation body listing the file moves and collection operations. */
+	summary: string;
+}
+
+/** What activating a row asks the command layer to do. */
+export type MemoryPanelAction =
+	| { kind: "apply"; extraScopes: string[] }
+	| { kind: "status"; expanded: boolean }
+	| MemoryPanelMigrateAction
+	| { kind: "none" };
+
+/** Matcher for the own scope: exact when hash-qualified, display form otherwise. */
+function panelOwnScopeMatcher(ownScope: string): (id: string) => boolean {
+	const ownDisplay = displayScopeId(ownScope);
+	const parsed = parseScopeId(ownScope);
+	const hashQualified = ownScope === "global" || parsed?.hash !== undefined;
+	return (id) => id === ownScope || (!hashQualified && displayScopeId(id) === ownDisplay);
+}
+
+/**
+ * Own-scope matcher for the panel and header. The session stores its own id in
+ * display form while the panel addresses it hash-qualified, so both forms
+ * count as the own entry; a same-slug sibling stays distinct.
+ */
+function panelOwnIdMatcher(ownScope: string): (id: string) => boolean {
+	const isOwn = panelOwnScopeMatcher(ownScope);
+	const ownDisplay = displayScopeId(ownScope);
+	return (id) => isOwn(id) || (id === ownDisplay && parseScopeId(id)?.hash === undefined);
+}
+
+/** Start a panel session from the applied scope set; staged starts equal to it. */
+export function createMemoryPanelState(
+	ownScope: string,
+	known: readonly string[],
+	activeScopes: readonly string[],
+	globalExists = true,
+): MemoryPanelState {
+	const isOwn = panelOwnIdMatcher(ownScope);
+	const staged: string[] = [];
+	for (const id of activeScopes) {
+		if (!isOwn(id) && !staged.includes(id)) staged.push(id);
+	}
+	return { ownScope, known: [...known], staged, statusExpanded: false, globalExists };
+}
+
+/**
+ * Row order: own scope pinned first and locked, project scopes A-Z, then
+ * `global` when it is not the own scope and exists on disk.
+ */
+export function buildMemoryPanelRows(state: MemoryPanelState): MemoryPanelRow[] {
+	const isOwn = panelOwnIdMatcher(state.ownScope);
+	const labels = ambiguousLabels(state.known);
+	const rows: MemoryPanelRow[] = [
+		{
+			rowId: state.ownScope,
+			label: labels.get(state.ownScope) ?? displayScopeId(state.ownScope),
+			locked: true,
+			isOwn: true,
+			staged: true,
+		},
+	];
+
+	const projects = state.known
+		.filter((id) => id !== "global" && !isOwn(id))
+		.map((id) => ({ id, label: labels.get(id) ?? displayScopeId(id) }))
+		.sort((a, b) => a.label.localeCompare(b.label));
+	for (const project of projects) {
+		rows.push({
+			rowId: project.id,
+			label: project.label,
+			locked: false,
+			isOwn: false,
+			staged: state.staged.includes(project.id),
+		});
+	}
+
+	if (state.ownScope !== "global" && state.known.includes("global") && state.globalExists) {
+		rows.push({
+			rowId: "global",
+			label: "global",
+			locked: false,
+			isOwn: false,
+			staged: state.staged.includes("global"),
+		});
+	}
+
+	rows.push({
+		rowId: MEMORY_PANEL_STATUS_ROW_ID,
+		label: "Status",
+		locked: false,
+		isOwn: false,
+		staged: false,
+		action: "status",
+	});
+	rows.push({
+		rowId: MEMORY_PANEL_MIGRATE_ROW_ID,
+		label: "Migrate",
+		locked: false,
+		isOwn: false,
+		staged: false,
+		action: "migrate",
+	});
+	return rows;
+}
+
+/**
+ * Flip a row's staged membership. The own scope, action rows and rows that do
+ * not exist are ignored. Staged extras keep row order, so applying is
+ * deterministic.
+ */
+export function toggleMemoryPanelRow(state: MemoryPanelState, rowId: string): MemoryPanelState {
+	const row = buildMemoryPanelRows(state).find((candidate) => candidate.rowId === rowId);
+	if (!row || row.locked || row.action) return state;
+	const staged = row.staged
+		? state.staged.filter((id) => id !== rowId)
+		: state.staged.filter((id) => id !== rowId).concat(rowId);
+	return { ...state, staged };
+}
+
+/**
+ * Enter on a scope row: apply the staged set. Extras come out in row order,
+ * which keeps the resulting set order stable regardless of toggle order.
+ * Enter on the Status row asks to expand or collapse its header block.
+ * Enter on the Migrate row: decide notify vs confirm from a fresh preview.
+ */
+function migratePanelAction(migration: MemoryPanelMigration): MemoryPanelMigrateAction {
+	if (migration.kind === "refused") {
+		return { kind: "migrate", refusal: migration.message, plan: null, nothingToMigrate: false, summary: "" };
+	}
+	if (migration.plan.alreadyMigrated) {
+		return { kind: "migrate", refusal: null, plan: migration.plan, nothingToMigrate: true, summary: "" };
+	}
+	return {
+		kind: "migrate",
+		refusal: null,
+		plan: migration.plan,
+		nothingToMigrate: false,
+		summary: formatMigratePlan(migration.plan),
+	};
+}
+
+export function activateMemoryPanelRow(
+	state: MemoryPanelState,
+	rowId: string,
+	migration?: MemoryPanelMigration,
+): MemoryPanelAction {
+	const rows = buildMemoryPanelRows(state);
+	const row = rows.find((candidate) => candidate.rowId === rowId);
+	if (!row) return { kind: "none" };
+	if (row.action === "status") return { kind: "status", expanded: !state.statusExpanded };
+	if (row.action === "migrate") return migration ? migratePanelAction(migration) : { kind: "none" };
+	const extraScopes = rows
+		.filter((candidate) => !candidate.isOwn && candidate.staged)
+		.map((candidate) => candidate.rowId);
+	return { kind: "apply", extraScopes };
+}
+
+/**
+ * One-line confirmation of the applied set, rendered under the refreshed
+ * header after a successful apply (spec: header plus a summary line).
+ */
+export function buildMemoryPanelSummary(state: MemoryPanelState): string {
+	const scopes = buildMemoryPanelRows(state)
+		.filter((row) => row.staged && !row.action)
+		.map((row) => `${row.label}${row.isOwn ? " (own)" : ""}`);
+	return `Applied: ${scopes.join(", ")}`;
+}
+
+/** Per-scope directories, computed without qmd, for the block while the probe runs. */
+function panelStatusScopeRows(
+	ownScope: string,
+	activeScopes: readonly string[],
+	memoryRoot: string,
+): MemoryStatusScopeRow[] {
+	const isOwn = panelOwnIdMatcher(ownScope);
+	return activeScopes.map((id) => {
+		let info: ScopeDirInfo | null = null;
+		try {
+			info = resolveScopeDirectory(memoryRoot, id);
+		} catch {
+			// Ambiguous display id: nothing safe to show, but never break the panel.
+		}
+		const dir = info?.dir ?? scopeDirPath(memoryRoot, id) ?? "?";
+		return {
+			id: displayScopeId(info?.id ?? id),
+			own: isOwn(id),
+			dir,
+			dirExists: dir !== "?" && fs.existsSync(dir),
+			collection: null,
+			collectionState: "unchecked",
+		};
+	});
+}
+
+/**
+ * Header: one line with the active scope set (own marked) and the memory root,
+ * rebuilt from the applied set on every render. Labels reuse the shared
+ * ambiguity rule, so two active same-slug scopes stay distinguishable. When the
+ * status block is supplied (Status expanded), each active scope's directory
+ * follows immediately; qmd readiness lands with the snapshot.
+ */
+export function buildMemoryPanelHeader(
+	ownScope: string,
+	activeScopes: readonly string[],
+	memoryRoot: string,
+	statusBlock?: MemoryPanelStatusBlock | null,
+): string {
+	const labels = ambiguousLabels(activeScopes);
+	const isOwn = panelOwnIdMatcher(ownScope);
+	const scopes = activeScopes
+		.map((id) => {
+			const label = labels.get(id) ?? displayScopeId(id);
+			return isOwn(id) ? `${label} (own)` : label;
+		})
+		.join(", ");
+	const lines = [`Scopes: ${scopes} · Root: ${memoryRoot}`];
+	if (statusBlock) {
+		const mark = (ok: boolean) => (ok ? "✓" : "✗");
+		const rows =
+			statusBlock.kind === "ready"
+				? statusBlock.snapshot.scopes
+				: panelStatusScopeRows(ownScope, activeScopes, memoryRoot);
+		lines.push("Status:");
+		for (const scope of rows) {
+			lines.push(
+				`- ${scope.id}${scope.own ? " (own)" : ""}: ${scope.dir} — ${scope.dirExists ? "exists ✓" : "missing ✗"}`,
+			);
+		}
+		if (statusBlock.kind === "pending") {
+			const frame = STATUS_SPINNER_FRAMES[(statusBlock.frame ?? 0) % STATUS_SPINNER_FRAMES.length];
+			lines.push(`- qmd: ${frame} checking`);
+		} else if (statusBlock.kind === "error") {
+			lines.push(`- qmd: ✗ status unavailable: ${statusBlock.message}`);
+		} else if (statusBlock.snapshot.qmdAvailable) {
+			lines.push(
+				`- qmd: ✓ available, collection \`${GLOBAL_COLLECTION_NAME}\`: ${mark(statusBlock.snapshot.collectionAvailable)}, embeddings: ${statusBlock.snapshot.embeddings}`,
+			);
+		} else {
+			lines.push("- qmd: ✗ unavailable");
+		}
+	}
+	return lines.join("\n");
+}
+
+/** The own scope id qualified with its hash when the directory exists, for exact row addressing. */
+function panelOwnScopeId(): string {
+	if (ownScopeId === "global") return "global";
+	const known = listKnownScopes(memoryRoot);
+	const ownDir = path.resolve(MEMORY_DIR);
+	const matched = known.find((id) => {
+		const dir = scopeDirPath(memoryRoot, id);
+		return dir !== null && path.resolve(dir) === ownDir;
+	});
+	if (matched) return matched;
+	const ownDisplay = displayScopeId(ownScopeId);
+	const candidates = known.filter((id) => displayScopeId(id) === ownDisplay);
+	return candidates.length === 1 ? candidates[0] : ownScopeId;
+}
+
+function currentPanelState(): MemoryPanelState {
+	return createMemoryPanelState(
+		panelOwnScopeId(),
+		listKnownScopes(memoryRoot),
+		activeScopeSet,
+		fs.existsSync(path.join(memoryRoot, "global")),
+	);
+}
+
+/** Fresh Migrate preview: the installed-extension refusal first, then the existing planner. */
+async function buildMemoryPanelMigration(): Promise<MemoryPanelMigration> {
+	const refusal = memoryScopeRefusal();
+	if (refusal) return { kind: "refused", message: refusal };
+	const qmdAvailable = await detectQmd();
+	const input: MigratePlanInput = {
+		memoryRoot,
+		qmdAvailable,
+		collections: qmdAvailable ? await readMigrationCollections(memoryRoot) : {},
+	};
+	return { kind: "planned", plan: planMemoryMigration(input) };
+}
+
+interface MemoryPanelActions {
+	/** Apply the staged extras; returns an error message when the apply failed. */
+	apply: (extraScopes: string[]) => string | null;
+	/** Rebuild the list state from the applied set after a successful apply. */
+	freshState: () => MemoryPanelState;
+	/** Header rebuilt from the applied set and, when expanded, the current status block. */
+	header: (ownScope: string, statusBlock: MemoryPanelStatusBlock | null) => string;
+	/** Gather the same status data the memory_status tool reports. */
+	status: () => Promise<MemoryStatusSnapshot>;
+	/** Fresh migration preview from the existing planner, or the installed-extension refusal. */
+	migratePreview: () => Promise<MemoryPanelMigration>;
+	/** Confirmation gate before a migration changes anything. */
+	confirmMigrate: (summary: string) => Promise<boolean>;
+	/** Apply through the existing command path; returns the failure text or null. */
+	applyMigrate: () => Promise<string | null>;
+	notify: (message: string, type?: "info" | "warning" | "error") => void;
+	close: () => void;
+}
+
+/**
+ * Flat panel over the list state: arrows move through pi's SelectList, space
+ * and tab toggle the highlighted scope, enter applies or expands Status, esc
+ * closes. The list is rebuilt on every state change (SelectList has no
+ * set-items API) and the highlighted row is restored by index.
+ */
+class MemoryPanelView implements Component {
+	private list: SelectList;
+	private state: MemoryPanelState;
+	private statusBlock: MemoryPanelStatusBlock | null = null;
+	private statusRequest = 0;
+	private spinFrame = 0;
+	private spinTimer: ReturnType<typeof setInterval> | null = null;
+	private selectedIndex = 0;
+	/** Last successful apply, shown as a summary line under the header. */
+	private summary: string | null = null;
+	private readonly theme: Theme;
+	private readonly actions: MemoryPanelActions;
+	private readonly requestRender: () => void;
+
+	constructor(theme: Theme, state: MemoryPanelState, actions: MemoryPanelActions, requestRender: () => void) {
+		this.theme = theme;
+		this.state = state;
+		this.actions = actions;
+		this.requestRender = requestRender;
+		this.list = this.buildList();
+	}
+
+	private selectListTheme(): SelectListTheme {
+		return {
+			selectedPrefix: (text) => this.theme.fg("accent", text),
+			selectedText: (text) => this.theme.fg("accent", text),
+			description: (text) => this.theme.fg("muted", text),
+			scrollInfo: (text) => this.theme.fg("dim", text),
+			noMatch: (text) => this.theme.fg("dim", text),
+		};
+	}
+
+	private buildList(): SelectList {
+		const items = buildMemoryPanelRows(this.state).map((row) => {
+			if (row.action === "status") {
+				return {
+					value: row.rowId,
+					label: `${row.label}${this.state.statusExpanded ? " (expanded)" : ""}`,
+					description: this.state.statusExpanded ? "enter to collapse" : "enter to show paths and qmd readiness",
+				};
+			}
+			if (row.action === "migrate") {
+				return {
+					value: row.rowId,
+					label: row.label,
+					description: "plan and apply the scope layout migration",
+				};
+			}
+			return {
+				value: row.rowId,
+				label: `${row.staged ? "[x]" : "[ ]"} ${row.label}${row.isOwn ? " (own)" : ""}`,
+				description: row.locked ? "locked: this session's scope" : undefined,
+			};
+		});
+		const list = new SelectList(items, 10, this.selectListTheme());
+		list.setSelectedIndex(this.selectedIndex);
+		list.onSelect = (item) => {
+			void this.activate(item.value);
+		};
+		list.onCancel = () => {
+			this.stopSpin();
+			this.actions.close();
+		};
+		list.onSelectionChange = (item) => {
+			const index = items.findIndex((candidate) => candidate.value === item.value);
+			if (index >= 0) this.selectedIndex = index;
+		};
+		return list;
+	}
+
+	private rebuild() {
+		this.list = this.buildList();
+	}
+
+	private toggle(rowId: string) {
+		const next = toggleMemoryPanelRow(this.state, rowId);
+		if (next === this.state) return;
+		this.state = next;
+		this.rebuild();
+	}
+
+	/** Tick the braille spinner while a probe is pending, matching pi's Loader cadence. */
+	private startSpin() {
+		this.spinFrame = 0;
+		if (this.spinTimer !== null) return;
+		this.spinTimer = setInterval(() => {
+			if (this.statusBlock?.kind !== "pending") return;
+			this.spinFrame++;
+			this.statusBlock = { kind: "pending", frame: this.spinFrame };
+			this.requestRender();
+		}, STATUS_SPINNER_INTERVAL_MS);
+	}
+
+	private stopSpin() {
+		if (this.spinTimer !== null) clearInterval(this.spinTimer);
+		this.spinTimer = null;
+	}
+
+	/**
+	 * Fetch status data off the input path. The block paints as pending first so
+	 * expanding Status is visibly instant, and the qmd line spins until the
+	 * snapshot lands; a failed probe reports itself instead of leaving the block
+	 * blank.
+	 */
+	private async loadStatus() {
+		const request = ++this.statusRequest;
+		this.startSpin();
+		this.statusBlock = { kind: "pending" };
+		this.requestRender();
+		try {
+			const snapshot = await this.actions.status();
+			if (request !== this.statusRequest || !this.state.statusExpanded) return;
+			this.statusBlock = { kind: "ready", snapshot };
+		} catch (err) {
+			if (request !== this.statusRequest || !this.state.statusExpanded) return;
+			this.statusBlock = { kind: "error", message: err instanceof Error ? err.message : String(err) };
+		}
+		this.stopSpin();
+		this.requestRender();
+	}
+
+	private async activate(rowId: string) {
+		if (rowId === MEMORY_PANEL_MIGRATE_ROW_ID) {
+			const action = activateMemoryPanelRow(this.state, rowId, await this.actions.migratePreview());
+			if (action.kind === "migrate") await this.runMigrate(action);
+			return;
+		}
+		const action = activateMemoryPanelRow(this.state, rowId);
+		if (action.kind === "none") return;
+		if (action.kind === "status") {
+			this.state = { ...this.state, statusExpanded: action.expanded };
+			if (!action.expanded) {
+				const wasPending = this.statusBlock?.kind === "pending";
+				// Drop the in-flight probe so a late result cannot reopen the block.
+				this.statusRequest++;
+				this.statusBlock = null;
+				this.stopSpin();
+				if (wasPending) this.actions.notify("status check canceled");
+			}
+			this.rebuild();
+			if (action.expanded) void this.loadStatus();
+			return;
+		}
+		if (action.kind !== "apply") return;
+		const wasExpanded = this.state.statusExpanded;
+		const error = this.actions.apply(action.extraScopes);
+		if (error) {
+			this.actions.notify(error, "error");
+			return;
+		}
+		this.state = { ...this.actions.freshState(), statusExpanded: wasExpanded };
+		this.summary = buildMemoryPanelSummary(this.state);
+		this.rebuild();
+		// The block describes the applied set, so refresh it when the apply changed it.
+		if (wasExpanded) void this.loadStatus();
+	}
+
+	/** Refusal and empty plans only notify; a real plan is confirmed before it applies. */
+	private async runMigrate(action: MemoryPanelMigrateAction) {
+		if (action.refusal) {
+			this.actions.notify(action.refusal, "warning");
+			return;
+		}
+		if (action.nothingToMigrate) {
+			this.actions.notify("nothing to migrate");
+			return;
+		}
+		if (!action.plan) return;
+		const wasExpanded = this.state.statusExpanded;
+		if (!(await this.actions.confirmMigrate(action.summary))) return;
+		let error: string | null;
+		try {
+			error = await this.actions.applyMigrate();
+		} catch (err) {
+			error = err instanceof Error ? err.message : String(err);
+		}
+		if (error) {
+			this.actions.notify(error, "error");
+			return;
+		}
+		this.actions.notify("migration applied");
+		// Row membership can change with the layout, so rebuild and refresh the block.
+		this.state = { ...this.actions.freshState(), statusExpanded: wasExpanded };
+		this.rebuild();
+		if (wasExpanded) void this.loadStatus();
+	}
+
+	handleInput(data: string): void {
+		if (data === " " || data === "\t") {
+			const selected = this.list.getSelectedItem();
+			if (selected) this.toggle(selected.value);
+			return;
+		}
+		this.list.handleInput(data);
+	}
+
+	render(width: number): string[] {
+		const header = this.actions.header(this.state.ownScope, this.state.statusExpanded ? this.statusBlock : null);
+		const lines = this.summary ? [header, this.summary] : [header];
+		return [...lines.join("\n").split("\n"), ...this.list.render(width)];
+	}
+
+	invalidate(): void {
+		this.list.invalidate();
+	}
+}
+
+/** Bare `/memory` in a TUI: the panel writes only the session's command layer. */
+async function openMemoryPanel(ctx: ExtensionCommandContext): Promise<void> {
+	await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
+		return new MemoryPanelView(
+			theme,
+			currentPanelState(),
+			{
+				apply: (extraScopes) => {
+					try {
+						applyScopeSetChange(extraScopes);
+						commandScopes = extraScopes;
+						return null;
+					} catch (err) {
+						return err instanceof Error ? err.message : String(err);
+					}
+				},
+				freshState: currentPanelState,
+				header: (ownScope, statusBlock) =>
+					buildMemoryPanelHeader(ownScope, activeScopeSet, memoryRoot, statusBlock),
+				status: gatherMemoryStatus,
+				migratePreview: buildMemoryPanelMigration,
+				confirmMigrate: (summary) => ctx.ui.confirm("Migrate memory layout?", summary),
+				applyMigrate: async () => {
+					// Keep one apply path: the command re-plans and executes; undo stays CLI-only.
+					const result = await runMemoryMigrate(["--apply"]);
+					return result.code === 0 ? null : result.text;
+				},
+				notify: (message, type) => ctx.ui.notify(message, type),
+				close: () => done(undefined),
+			},
+			() => tui.requestRender(),
+		);
+	});
+}
+
 // ---------------------------------------------------------------------------
 // Extension entry point
 // ---------------------------------------------------------------------------
@@ -2024,6 +3050,8 @@ interface ScopeReadResult {
 	text: string;
 	details: Record<string, unknown>;
 	isError?: boolean;
+	/** No content in this scope: grouped reads omit empty scopes instead of printing headings. */
+	empty?: boolean;
 }
 
 function readMemoryTarget(scopeDir: string, target: MemoryReadTarget, date?: string): ScopeReadResult {
@@ -2034,10 +3062,10 @@ function readMemoryTarget(scopeDir: string, target: MemoryReadTarget, date?: str
 				.filter((f) => f.endsWith(".md"))
 				.sort()
 				.reverse();
-			if (files.length === 0) return { text: "No daily logs found.", details: {} };
+			if (files.length === 0) return { text: "No daily logs found.", details: {}, empty: true };
 			return { text: `Daily logs:\n${files.map((f) => `- ${f}`).join("\n")}`, details: { files } };
 		} catch {
-			return { text: "No daily logs directory.", details: {} };
+			return { text: "No daily logs directory.", details: {}, empty: true };
 		}
 	}
 
@@ -2048,20 +3076,20 @@ function readMemoryTarget(scopeDir: string, target: MemoryReadTarget, date?: str
 		}
 		const filePath = dailyPathIn(scopeDir, d);
 		const content = readFileSafe(filePath);
-		if (!content) return { text: `No daily log for ${d}.`, details: {} };
+		if (!content) return { text: `No daily log for ${d}.`, details: {}, empty: true };
 		return { text: content, details: { path: filePath, date: d } };
 	}
 
 	if (target === "scratchpad") {
 		const filePath = path.join(scopeDir, "SCRATCHPAD.md");
 		const content = readFileSafe(filePath);
-		if (!content?.trim()) return { text: "SCRATCHPAD.md is empty or does not exist.", details: {} };
+		if (!content?.trim()) return { text: "SCRATCHPAD.md is empty or does not exist.", details: {}, empty: true };
 		return { text: content, details: { path: filePath } };
 	}
 
 	const filePath = path.join(scopeDir, "MEMORY.md");
 	const content = readFileSafe(filePath);
-	if (!content) return { text: "MEMORY.md is empty or does not exist.", details: {} };
+	if (!content) return { text: "MEMORY.md is empty or does not exist.", details: {}, empty: true };
 	return { text: content, details: { path: filePath } };
 }
 
@@ -2073,14 +3101,813 @@ function toolError(err: unknown) {
 	};
 }
 
+// ---------------------------------------------------------------------------
+// Migration (spec chapter 7): /memory migrate plan/apply/undo
+//
+// The planner is pure: it reads the source/target layout and returns plain
+// data. Execution performs exactly the listed actions, files first and qmd
+// second. Nothing here registers a pi command; the /memory command in ticket
+// #16 calls runMemoryMigrate().
+// ---------------------------------------------------------------------------
+
+let extensionsDirOverride: string | null = null;
+
+/** Override the extensions directory (for testing); null restores the default. */
+export function _setExtensionsDirForTest(dir: string | null) {
+	extensionsDirOverride = dir;
+}
+
+/**
+ * Default extensions directory, derived from the memory root so no homedir
+ * lookup leaks into the planner: `~/.pi/agent/memory` -> `~/.pi/agent/extensions`.
+ */
+function defaultExtensionsDir(): string {
+	return path.join(path.dirname(memoryRoot), "extensions");
+}
+
+function resolveExtensionsDir(): string {
+	return extensionsDirOverride ?? defaultExtensionsDir();
+}
+
+/** Verbatim refusal shared by `/memory migrate` and the panel's Migrate row. */
+function memoryScopeRefusal(): string | null {
+	const memoryScopePath = path.join(resolveExtensionsDir(), "memory-scope.ts");
+	if (!fs.existsSync(memoryScopePath)) return null;
+	return [
+		`refusing to migrate: ${memoryScopePath} still exists.`,
+		"It re-points the pi-memory collection at the current project directory at module load, which would immediately undo the migration.",
+		"Rename that file, then run /reload.",
+	].join("\n");
+}
+
+export type MigrateActionStatus = "pending" | "done" | "skipped" | "failed";
+export type MigrateCollectionAction = "repoint" | "create";
+
+export interface MigrateMoveAction {
+	kind: "move";
+	/** Path relative to the memory root, with `/` separators. */
+	from: string;
+	/** Path relative to the memory root, with `/` separators. */
+	to: string;
+	dir: boolean;
+	files: number;
+	bytes: number;
+	conflict: boolean;
+	status: MigrateActionStatus;
+}
+
+export interface MigrateKeepAction {
+	kind: "keep";
+	entry: string;
+	status: "skipped";
+}
+
+export interface MigrateRemoveCollectionAction {
+	kind: "removeCollection";
+	name: string;
+	path: string | null;
+	status: MigrateActionStatus;
+}
+
+export interface MigrateAddCollectionAction {
+	kind: "addCollection";
+	name: string;
+	path: string;
+	manifestAction: MigrateCollectionAction;
+	status: MigrateActionStatus;
+}
+
+export interface MigrateAddContextAction {
+	kind: "addContext";
+	collection: string;
+	/** `daily` or the empty string for the collection root. */
+	subPath: string;
+	status: MigrateActionStatus;
+}
+
+export interface MigrateUpdateIndexAction {
+	kind: "updateIndex";
+	status: MigrateActionStatus;
+}
+
+export type MigrateAction =
+	| MigrateMoveAction
+	| MigrateKeepAction
+	| MigrateRemoveCollectionAction
+	| MigrateAddCollectionAction
+	| MigrateAddContextAction
+	| MigrateUpdateIndexAction;
+
+export interface MigratePlanInput {
+	memoryRoot: string;
+	qmdAvailable: boolean;
+	/** Existing qmd collections: name -> indexed path. Absent when qmd is unavailable. */
+	collections?: Record<string, string | null>;
+}
+
+export interface MigratePlan {
+	memoryRoot: string;
+	qmdAvailable: boolean;
+	actions: MigrateAction[];
+	fileOperations: number;
+	collectionOperations: number;
+	conflicts: number;
+	alreadyMigrated: boolean;
+}
+
+export interface MigrationManifest {
+	version: 1;
+	timestamp: string;
+	moves: Array<{ from: string; to: string }>;
+	collections: Array<{ name: string; action: MigrateCollectionAction; path: string }>;
+	contexts: Array<{ collection: string; path: string }>;
+}
+
+const MIGRATION_FILE_ENTRIES = ["MEMORY.md", "SCRATCHPAD.md", "daily", "recovery"];
+const MIGRATION_LAYOUT_ENTRIES = new Set([...MIGRATION_FILE_ENTRIES, "global", "projects", ".migration-manifest.json"]);
+
+function inspectTree(target: string): { files: number; bytes: number } {
+	let stat: fs.Stats;
+	try {
+		stat = fs.statSync(target);
+	} catch {
+		return { files: 0, bytes: 0 };
+	}
+	if (!stat.isDirectory()) return { files: 1, bytes: stat.size };
+	let files = 0;
+	let bytes = 0;
+	for (const entry of fs.readdirSync(target)) {
+		const child = inspectTree(path.join(target, entry));
+		files += child.files;
+		bytes += child.bytes;
+	}
+	return { files, bytes };
+}
+
+function planMoveAction(root: string, fromRel: string, toRel: string): MigrateMoveAction | null {
+	const fromAbs = path.join(root, fromRel);
+	const toAbs = path.join(root, toRel);
+	let stat: fs.Stats;
+	try {
+		stat = fs.lstatSync(fromAbs);
+	} catch {
+		return null;
+	}
+	const tree = inspectTree(fromAbs);
+	const conflict = fs.existsSync(toAbs);
+	return {
+		kind: "move",
+		from: fromRel.split(path.sep).join("/"),
+		to: toRel.split(path.sep).join("/"),
+		dir: stat.isDirectory(),
+		files: tree.files,
+		bytes: tree.bytes,
+		conflict,
+		status: conflict ? "skipped" : "pending",
+	};
+}
+
+function buildMigratePlan(input: MigratePlanInput, actions: MigrateAction[], alreadyMigrated: boolean): MigratePlan {
+	return {
+		memoryRoot: input.memoryRoot,
+		qmdAvailable: input.qmdAvailable,
+		actions,
+		fileOperations: actions.filter((action) => action.kind === "move" || action.kind === "keep").length,
+		collectionOperations: actions.filter(
+			(action) => action.kind === "removeCollection" || action.kind === "addCollection",
+		).length,
+		conflicts: actions.filter((action) => action.kind === "move" && action.conflict).length,
+		alreadyMigrated,
+	};
+}
+
+/**
+ * Pure planner for `--apply`: the legacy entries still at the top level move
+ * into global/, `projects/<dir>/` is adopted as-is, unrecognised entries stay
+ * put, and qmd is re-pointed only after the moves.
+ */
+export function planMemoryMigration(input: MigratePlanInput): MigratePlan {
+	const root = input.memoryRoot;
+	const collections = input.collections ?? {};
+	const actions: MigrateAction[] = [];
+
+	for (const entry of MIGRATION_FILE_ENTRIES) {
+		const move = planMoveAction(root, entry, `global/${entry}`);
+		if (move) actions.push(move);
+	}
+
+	let topLevel: fs.Dirent[] = [];
+	try {
+		topLevel = fs.readdirSync(root, { withFileTypes: true });
+	} catch {
+		topLevel = [];
+	}
+	for (const entry of [...topLevel].sort((a, b) => a.name.localeCompare(b.name))) {
+		if (MIGRATION_LAYOUT_ENTRIES.has(entry.name)) continue;
+		actions.push({ kind: "keep", entry: entry.name, status: "skipped" });
+	}
+
+	const hasFileWork = actions.some((action) => action.kind === "move");
+	// Without qmd the collections cannot be inspected; a layout with no file
+	// work left is migrated as far as this command can tell.
+	if (!input.qmdAvailable && !hasFileWork) {
+		return buildMigratePlan(input, actions, true);
+	}
+
+	const qmdStatus: MigrateActionStatus = input.qmdAvailable ? "pending" : "skipped";
+	const collectionActions: MigrateAction[] = [];
+	const globalDir = path.join(root, "global");
+	const currentGlobal = collections[GLOBAL_COLLECTION_NAME];
+	const globalRegistered = typeof currentGlobal === "string";
+	const globalAtTarget = globalRegistered && qmdPathsEqual(currentGlobal, globalDir);
+	if (globalRegistered && !globalAtTarget) {
+		collectionActions.push({
+			kind: "removeCollection",
+			name: GLOBAL_COLLECTION_NAME,
+			path: currentGlobal,
+			status: qmdStatus,
+		});
+	}
+	if (!globalAtTarget) {
+		collectionActions.push({
+			kind: "addCollection",
+			name: GLOBAL_COLLECTION_NAME,
+			path: globalDir,
+			manifestAction: globalRegistered ? "repoint" : "create",
+			status: qmdStatus,
+		});
+		for (const [subPath] of QMD_CONTEXT_SPECS) {
+			collectionActions.push({ kind: "addContext", collection: GLOBAL_COLLECTION_NAME, subPath, status: qmdStatus });
+		}
+	}
+	for (const scope of scanProjectScopes(root)) {
+		const name = path.basename(scope.dir);
+		if (typeof collections[name] === "string") continue;
+		collectionActions.push({
+			kind: "addCollection",
+			name,
+			path: scope.dir,
+			manifestAction: "create",
+			status: qmdStatus,
+		});
+		for (const [subPath] of QMD_CONTEXT_SPECS) {
+			collectionActions.push({ kind: "addContext", collection: name, subPath, status: qmdStatus });
+		}
+	}
+	if (collectionActions.length > 0) {
+		actions.push(...collectionActions, { kind: "updateIndex", status: qmdStatus });
+	}
+
+	const alreadyMigrated = !hasFileWork && collectionActions.length === 0;
+	return buildMigratePlan(input, actions, alreadyMigrated);
+}
+
+/** Pure planner for `--undo`: replay the manifest in reverse. */
+export function planMemoryUndo(input: MigratePlanInput, manifest: MigrationManifest): MigratePlan {
+	const root = input.memoryRoot;
+	const collections = input.collections ?? {};
+	const actions: MigrateAction[] = [];
+
+	for (const move of [...manifest.moves].reverse()) {
+		const action = planMoveAction(root, move.to, move.from);
+		if (action) actions.push(action);
+	}
+
+	const qmdStatus: MigrateActionStatus = input.qmdAvailable ? "pending" : "skipped";
+	const collectionActions: MigrateAction[] = [];
+	for (const collection of manifest.collections) {
+		if (collection.action === "create") {
+			if (input.qmdAvailable && typeof collections[collection.name] !== "string") continue;
+			collectionActions.push({
+				kind: "removeCollection",
+				name: collection.name,
+				path: typeof collections[collection.name] === "string" ? collections[collection.name] : null,
+				status: qmdStatus,
+			});
+			continue;
+		}
+		// repoint: drop the scoped collection and restore the legacy one at the root.
+		if (typeof collections[collection.name] === "string") {
+			collectionActions.push({
+				kind: "removeCollection",
+				name: collection.name,
+				path: collections[collection.name],
+				status: qmdStatus,
+			});
+		}
+		collectionActions.push({
+			kind: "addCollection",
+			name: collection.name,
+			path: root,
+			manifestAction: "repoint",
+			status: qmdStatus,
+		});
+		const manifestPaths = manifest.contexts
+			.filter((context) => context.collection === collection.name)
+			.map((context) => context.path);
+		const subPaths =
+			manifestPaths.length > 0
+				? manifestPaths.map((manifestPath) => (manifestPath === "/" ? "" : manifestPath.replace(/^\//, "")))
+				: QMD_CONTEXT_SPECS.map(([subPath]) => subPath);
+		for (const subPath of subPaths) {
+			collectionActions.push({ kind: "addContext", collection: collection.name, subPath, status: qmdStatus });
+		}
+	}
+	if (collectionActions.length > 0) {
+		actions.push(...collectionActions, { kind: "updateIndex", status: qmdStatus });
+	}
+
+	const hasMoveWork = actions.some((action) => action.kind === "move");
+	const alreadyMigrated = !hasMoveWork && collectionActions.length === 0;
+	return buildMigratePlan(input, actions, alreadyMigrated);
+}
+
+export function readMigrationManifest(root: string): MigrationManifest | null {
+	const raw = readFileSafe(path.join(root, ".migration-manifest.json"));
+	if (raw === null) return null;
+	try {
+		const parsed = JSON.parse(raw);
+		if (
+			!parsed ||
+			parsed.version !== 1 ||
+			!Array.isArray(parsed.moves) ||
+			!Array.isArray(parsed.collections) ||
+			!Array.isArray(parsed.contexts)
+		) {
+			return null;
+		}
+		return parsed as MigrationManifest;
+	} catch {
+		return null;
+	}
+}
+
+function writeMigrationManifest(root: string, plan: MigratePlan) {
+	// Merge with an earlier partial run: a re-run that only completes the qmd
+	// steps must not drop the moves the first run recorded, or --undo could
+	// never move the files back.
+	const previous = readMigrationManifest(root);
+	const moves = [...(previous?.moves ?? [])];
+	for (const action of plan.actions) {
+		if (action.kind !== "move" || action.conflict || action.status !== "done") continue;
+		if (moves.some((move) => move.from === action.from)) continue;
+		moves.push({ from: action.from, to: action.to });
+	}
+	const collections = [...(previous?.collections ?? [])];
+	for (const action of plan.actions) {
+		if (action.kind !== "addCollection" || action.status !== "done") continue;
+		const entry = { name: action.name, action: action.manifestAction, path: action.path };
+		const index = collections.findIndex((collection) => collection.name === action.name);
+		if (index === -1) collections.push(entry);
+		else collections[index] = entry;
+	}
+	const contexts = [...(previous?.contexts ?? [])];
+	for (const action of plan.actions) {
+		if (action.kind !== "addContext" || action.status !== "done") continue;
+		const contextPath = action.subPath === "" ? "/" : `/${action.subPath}`;
+		if (contexts.some((context) => context.collection === action.collection && context.path === contextPath))
+			continue;
+		contexts.push({ collection: action.collection, path: contextPath });
+	}
+	const manifest: MigrationManifest = {
+		version: 1,
+		timestamp: new Date().toISOString(),
+		moves,
+		collections,
+		contexts,
+	};
+	fs.writeFileSync(path.join(root, ".migration-manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, "utf-8");
+}
+
+function copyTreeSync(from: string, to: string) {
+	const stat = fs.statSync(from);
+	if (stat.isDirectory()) {
+		fs.mkdirSync(to, { recursive: true });
+		for (const entry of fs.readdirSync(from)) copyTreeSync(path.join(from, entry), path.join(to, entry));
+		return;
+	}
+	fs.copyFileSync(from, to);
+}
+
+function verifyTreeSync(from: string, to: string) {
+	const source = inspectTree(from);
+	const copy = inspectTree(to);
+	if (source.files !== copy.files || source.bytes !== copy.bytes) {
+		throw new Error(
+			`copy verification failed for ${from}: expected ${source.files} files/${source.bytes} bytes, got ${copy.files}/${copy.bytes}`,
+		);
+	}
+}
+
+/**
+ * Rename within the tree; on EXDEV fall back to copy -> verify -> delete.
+ * No backup copy: the manifest makes the moves reversible.
+ */
+export function movePathSync(
+	from: string,
+	to: string,
+	rename: (oldPath: string, newPath: string) => void = (oldPath, newPath) => fs.renameSync(oldPath, newPath),
+): void {
+	try {
+		rename(from, to);
+		return;
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code !== "EXDEV") throw err;
+	}
+	copyTreeSync(from, to);
+	verifyTreeSync(from, to);
+	fs.rmSync(from, { recursive: true, force: true });
+}
+
+interface MigrationOutcome {
+	conflicts: number;
+	failed: number;
+}
+
+function qmdContextDescription(subPath: string): string {
+	const spec = QMD_CONTEXT_SPECS.find(([candidate]) => candidate === subPath);
+	return spec ? spec[1] : "";
+}
+
+async function executeMigratePlan(plan: MigratePlan, root: string): Promise<MigrationOutcome> {
+	let conflicts = 0;
+	let failed = 0;
+
+	// File moves complete before any qmd step touches the index.
+	for (const action of plan.actions) {
+		if (action.kind !== "move") continue;
+		if (action.conflict) {
+			conflicts++;
+			continue;
+		}
+		try {
+			const toAbs = path.join(root, action.to);
+			fs.mkdirSync(path.dirname(toAbs), { recursive: true });
+			movePathSync(path.join(root, action.from), toAbs);
+			action.status = "done";
+		} catch {
+			action.status = "failed";
+			failed++;
+		}
+	}
+
+	if (!plan.qmdAvailable) return { conflicts, failed };
+
+	for (const action of plan.actions) {
+		if (action.kind !== "removeCollection") continue;
+		const ok = await runQmd(["collection", "remove", action.name]);
+		action.status = ok ? "done" : "failed";
+		if (ok) qmdCollectionStatusCache.delete(action.name);
+		else failed++;
+	}
+
+	for (const action of plan.actions) {
+		if (action.kind !== "addCollection") continue;
+		let ok = false;
+		try {
+			fs.mkdirSync(action.path, { recursive: true });
+			ok = await runQmd(["collection", "add", action.path, "--name", action.name]);
+		} catch {
+			ok = false;
+		}
+		action.status = ok ? "done" : "failed";
+		if (ok) qmdCollectionStatusCache.set(action.name, { checkedAt: Date.now(), exists: true, path: action.path });
+		else failed++;
+	}
+
+	for (const action of plan.actions) {
+		if (action.kind !== "addContext") continue;
+		const ok = await runQmd([
+			"context",
+			"add",
+			`qmd://${action.collection}/${action.subPath}`,
+			qmdContextDescription(action.subPath),
+		]);
+		action.status = ok ? "done" : "failed";
+		if (!ok) failed++;
+	}
+
+	for (const action of plan.actions) {
+		if (action.kind !== "updateIndex") continue;
+		const ok = await runQmd(["update"], 30_000);
+		action.status = ok ? "done" : "failed";
+		if (!ok) failed++;
+	}
+
+	return { conflicts, failed };
+}
+
+function displayMigratePath(root: string, target: string): string {
+	const base = path.basename(root);
+	const relative = path.relative(root, target);
+	if (!relative) return base;
+	return `${base}/${relative.split(path.sep).join("/")}`;
+}
+
+function formatFileSize(bytes: number): string {
+	if (bytes < 1024) return `${bytes} B`;
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+	return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function migrateStatusSuffix(plan: MigratePlan, action: MigrateAction, applied: boolean): string {
+	if (action.kind === "keep") return "";
+	if (action.status === "failed") return "  (failed)";
+	if (action.status === "skipped") {
+		return plan.qmdAvailable ? "  (skipped)" : "  (skipped: qmd not available)";
+	}
+	return applied ? "  (done)" : "";
+}
+
+/** Print the plan in the chapter 7.4 format: one line per action, then a summary. */
+export function formatMigratePlan(plan: MigratePlan, opts: { applied?: boolean } = {}): string {
+	const applied = opts.applied === true;
+	const lines: string[] = ["plan:"];
+	for (let i = 0; i < plan.actions.length; i++) {
+		const action = plan.actions[i];
+		switch (action.kind) {
+			case "move": {
+				const from = action.dir ? `${action.from}/` : action.from;
+				const to = action.dir ? `${action.to}/` : action.to;
+				const detail = action.dir ? `${action.files} files` : formatFileSize(action.bytes);
+				const suffix = action.conflict
+					? "  (conflict: exists at both ends; skipped)"
+					: migrateStatusSuffix(plan, action, applied);
+				lines.push(`  move    ${from.padEnd(20)} -> ${to.padEnd(28)} (${detail})${suffix}`);
+				break;
+			}
+			case "keep":
+				lines.push(`  keep    ${action.entry}  (unrecognised, left in place)`);
+				break;
+			case "removeCollection": {
+				const where = action.path ? `${displayMigratePath(plan.memoryRoot, action.path)}/` : "an unknown path";
+				lines.push(
+					`  remove  collection ${action.name}  (points at ${where})${migrateStatusSuffix(plan, action, applied)}`,
+				);
+				break;
+			}
+			case "addCollection": {
+				const target = displayMigratePath(plan.memoryRoot, action.path);
+				const shown = action.name === GLOBAL_COLLECTION_NAME ? `${target}/` : target;
+				lines.push(`  add     collection ${action.name}  -> ${shown}${migrateStatusSuffix(plan, action, applied)}`);
+				break;
+			}
+			case "addContext": {
+				const collection = action.collection;
+				const paths: string[] = [];
+				let suffix = "";
+				let index = i;
+				while (index < plan.actions.length) {
+					const next = plan.actions[index];
+					if (!next || next.kind !== "addContext" || next.collection !== collection) break;
+					paths.push(`${collection}/${next.subPath}`);
+					const nextSuffix = migrateStatusSuffix(plan, next, applied);
+					if (nextSuffix) suffix = nextSuffix;
+					index++;
+				}
+				i = index - 1;
+				lines.push(`  context ${paths.join(", ")}${suffix}`);
+				break;
+			}
+			case "updateIndex":
+				lines.push(`  update  qmd index${migrateStatusSuffix(plan, action, applied)}`);
+				break;
+		}
+	}
+	const changes = applied ? plan.actions.filter((action) => action.status === "done").length : 0;
+	lines.push(
+		`summary: ${plan.fileOperations} file operations, ${plan.collectionOperations} collection operations, ${changes} changes made`,
+	);
+	return lines.join("\n");
+}
+
+const MIGRATE_USAGE = [
+	"usage: /memory migrate [--apply] [--undo]",
+	"  (no flags)       print the migration plan",
+	"  --apply          execute the plan",
+	"  --undo           plan the reverse of a completed migration",
+	"  --undo --apply   execute the undo",
+].join("\n");
+
+function parseMigrateArgs(args: string[]): { apply: boolean; undo: boolean; error?: string } {
+	let apply = false;
+	let undo = false;
+	for (const arg of args) {
+		if (arg === "--apply") apply = true;
+		else if (arg === "--undo") undo = true;
+		else return { apply, undo, error: `unknown option: ${arg}` };
+	}
+	return { apply, undo };
+}
+
+async function readMigrationCollections(root: string): Promise<Record<string, string>> {
+	const names = [GLOBAL_COLLECTION_NAME, ...scanProjectScopes(root).map((scope) => path.basename(scope.dir))];
+	const found: Record<string, string> = {};
+	for (const name of names) {
+		const info = await inspectCollection(name);
+		if (info.exists && info.path) found[name] = info.path;
+	}
+	return found;
+}
+
+function migrationNotes(plan: MigratePlan, outcome: MigrationOutcome, undo: boolean): string {
+	const notes: string[] = [];
+	if (outcome.conflicts > 0) notes.push(`conflicts: ${outcome.conflicts} (skipped; resolve and re-run)`);
+	if (outcome.failed > 0) notes.push(`failed: ${outcome.failed} (the migration is re-runnable)`);
+	if (!plan.qmdAvailable) {
+		notes.push("qmd: not available — collection steps skipped; the next session start creates them.");
+	} else if (plan.actions.some((action) => action.kind === "removeCollection" && action.status === "done")) {
+		notes.push("qmd: old vectors are now orphaned; run `qmd cleanup` to reclaim them.");
+	}
+	if (undo) notes.push("undo: the legacy layout is restored.");
+	return notes.join("\n");
+}
+
+/**
+ * Entry point for `/memory migrate` (ticket #16 wires the command):
+ * plan by default, `--apply` executes, `--undo` plans the reverse.
+ */
+export async function runMemoryMigrate(args: string[]): Promise<{ text: string; code: 0 | 1 | 2 }> {
+	const parsed = parseMigrateArgs(args);
+	if (parsed.error) return { text: `${parsed.error}\n${MIGRATE_USAGE}`, code: 2 };
+
+	const root = memoryRoot;
+	const refusal = memoryScopeRefusal();
+	if (refusal) return { text: refusal, code: 2 };
+
+	let manifest: MigrationManifest | null = null;
+	if (parsed.undo) {
+		manifest = readMigrationManifest(root);
+		if (!manifest) {
+			return {
+				text: `no migration manifest at ${path.join(root, ".migration-manifest.json")}; nothing to undo.`,
+				code: 1,
+			};
+		}
+	}
+
+	const qmdAvailable = await detectQmd();
+	const input: MigratePlanInput = {
+		memoryRoot: root,
+		qmdAvailable,
+		collections: qmdAvailable ? await readMigrationCollections(root) : {},
+	};
+	const plan = parsed.undo ? planMemoryUndo(input, manifest as MigrationManifest) : planMemoryMigration(input);
+
+	if (plan.alreadyMigrated) {
+		return { text: parsed.undo ? "nothing to undo" : "already migrated: nothing to do", code: 0 };
+	}
+	if (!parsed.apply) {
+		return { text: formatMigratePlan(plan), code: plan.conflicts > 0 ? 1 : 0 };
+	}
+
+	const outcome = await executeMigratePlan(plan, root);
+	if (parsed.undo) {
+		// Keep the manifest when qmd could not restore the collections: a later
+		// `--undo --apply` retries just the qmd steps.
+		const qmdStepsSkipped = plan.actions.some(
+			(action) =>
+				(action.kind === "removeCollection" || action.kind === "addCollection" || action.kind === "addContext") &&
+				action.status === "skipped",
+		);
+		if (outcome.conflicts === 0 && outcome.failed === 0 && !qmdStepsSkipped) {
+			try {
+				fs.rmSync(path.join(root, ".migration-manifest.json"), { force: true });
+			} catch {
+				// The undo itself succeeded; a stale manifest is only metadata.
+			}
+		}
+	} else {
+		writeMigrationManifest(root, plan);
+	}
+
+	const note = migrationNotes(plan, outcome, parsed.undo);
+	const text = note
+		? `${formatMigratePlan(plan, { applied: true })}\n${note}`
+		: formatMigratePlan(plan, { applied: true });
+	return { text, code: outcome.conflicts > 0 || outcome.failed > 0 ? 1 : 0 };
+}
+
 export default function (pi: ExtensionAPI) {
+	// --- /memory: report, session-only scope override, scope listing, migration ---
+	pi.registerCommand("memory", {
+		description: "Show the active memory scopes or change them for this session",
+		getArgumentCompletions: memoryArgumentCompletions,
+		handler: async (args, ctx) => {
+			const tokens = args.trim().split(/\s+/).filter(Boolean);
+			const send = (text: string) => pi.sendMessage({ customType: "pi-memory", content: text, display: true });
+			const projectRoot = projectRootFor(ctx.cwd);
+			const errorText = (err: unknown) => (err instanceof Error ? err.message : String(err));
+
+			if (tokens.length === 0) {
+				// Bare /memory is the only interactive entry point; everywhere
+				// else (print, JSON, RPC) it keeps printing the plain report.
+				if (ctx.mode === "tui") {
+					await openMemoryPanel(ctx);
+					return;
+				}
+				send(buildScopeReport(projectRoot));
+				return;
+			}
+
+			const [verb, ...rest] = tokens;
+
+			if (verb === "scope") {
+				if (rest.length === 0) {
+					// Reset to the next layer down (env, config, default).
+					commandScopes = null;
+					try {
+						const resolved = projectRoot ? resolveScopeSet(projectRoot, { trusted: sessionTrusted }) : null;
+						applyScopeSetChange(resolved?.extraScopes ?? []);
+					} catch (err) {
+						send(errorText(err));
+						return;
+					}
+					send(buildScopeReport(projectRoot));
+					return;
+				}
+
+				// Resolve every id before touching state: an unknown or ambiguous
+				// id leaves both the override and the active set unchanged.
+				let ids: string[];
+				try {
+					const known = listKnownScopes(memoryRoot);
+					ids = [];
+					for (const ref of rest) {
+						const id = resolveScopeReference(ref, known);
+						if (!ids.includes(id)) ids.push(id);
+					}
+				} catch (err) {
+					send(errorText(err));
+					return;
+				}
+				try {
+					applyScopeSetChange(ids);
+					commandScopes = ids;
+				} catch (err) {
+					send(errorText(err));
+					return;
+				}
+				send(buildScopeReport(projectRoot));
+				return;
+			}
+
+			if (verb === "scopes") {
+				const own = displayScopeId(ownScopeId);
+				const active = new Set(activeScopeSet.map(displayScopeId));
+				const lines = ["Known scopes:"];
+				for (const id of listKnownScopes(memoryRoot)) {
+					const display = displayScopeId(id);
+					const markers: string[] = [];
+					if (display === own) markers.push("(own)");
+					if (active.has(display)) markers.push("(active)");
+					lines.push(`- ${display}${markers.length > 0 ? ` ${markers.join(" ")}` : ""}`);
+				}
+				send(lines.join("\n"));
+				return;
+			}
+
+			if (verb === "migrate") {
+				const result = await runMemoryMigrate(rest);
+				send(result.code === 0 ? result.text : `${result.text}\n(exit ${result.code})`);
+				return;
+			}
+
+			send(`unknown /memory verb "${verb}"; ${MEMORY_USAGE}`);
+		},
+	});
+
 	// --- session_start: detect qmd, auto-setup collection ---
 	pi.on("session_start", async (_event, ctx) => {
 		exitSummaryReason = null;
+		// The command layer is session-only: every session starts at the next
+		// layer down (env, config, default).
+		commandScopes = null;
+		scopeEnvWarning = null;
+		sessionTrusted = undefined;
 		// Scope identity is path-bound and resolution happens here, from the
 		// session's cwd — never from process.cwd() (the launch dir).
 		const cwd = typeof ctx.cwd === "string" ? ctx.cwd.trim() : "";
-		if (cwd) applySessionScopeSet(projectRootFor(cwd));
+		if (cwd) {
+			const trusted = typeof ctx.isProjectTrusted === "function" ? ctx.isProjectTrusted() : undefined;
+			applySessionScopeSet(projectRootFor(cwd), trusted);
+		}
+
+		// §8.4: PI_MEMORY_DIR stays an honoured override, but a scope-shaped
+		// directory means the user pointed it one level too deep. Warn once per
+		// session; never fail the session.
+		const sessionId = ctx.sessionManager?.getSessionId?.() ?? null;
+		const dirWarning = memoryDirWarning();
+		if (dirWarning && memoryDirWarnedSession !== sessionId) {
+			memoryDirWarnedSession = sessionId;
+			pi.sendMessage({ customType: "pi-memory", content: dirWarning, display: true });
+		}
+		// §3.2: a bad PI_MEMORY_SCOPES id never silently changes the set; the
+		// env layer was ignored and the user is told once, here.
+		if (scopeEnvWarning) {
+			pi.sendMessage({ customType: "pi-memory", content: scopeEnvWarning, display: true });
+		}
+
 		if (terminalInputUnsubscribe) {
 			terminalInputUnsubscribe();
 			terminalInputUnsubscribe = null;
@@ -2309,7 +4136,7 @@ export default function (pi: ExtensionAPI) {
 			"- 'long_term': Write to MEMORY.md (curated durable facts, decisions, preferences). Mode: 'append' or 'overwrite'.",
 			"- 'daily': Append to today's daily log (daily/<YYYY-MM-DD>.md). Always appends.",
 			"Use this when the user asks you to remember something, or when you learn important preferences/decisions.",
-			"Writes target your own project scope by default; 'global' is the only other writable scope.",
+			"`scope` is optional and defaults to your own scope. Writes are allowed only to your own scope or 'global'; other scopes are rejected.",
 			"Use #tags (e.g. #decision, #preference, #lesson, #bug) and [[links]] (e.g. [[auth-strategy]]) in content to improve searchability.",
 		].join("\n"),
 		parameters: Type.Object({
@@ -2442,7 +4269,7 @@ export default function (pi: ExtensionAPI) {
 			"- 'undo': Uncheck a done item back to open. Match by substring.",
 			"- 'clear_done': Remove all checked items from the list.",
 			"- 'list': Show all items.",
-			"The scratchpad belongs to your own project scope by default; 'global' is the only other writable scope.",
+			"`scope` is optional and defaults to your own scope. Writes are allowed only to your own scope or 'global'; other scopes are rejected.",
 		].join("\n"),
 		parameters: Type.Object({
 			action: StringEnum(["add", "done", "undo", "clear_done", "list"] as const, {
@@ -2629,7 +4456,8 @@ export default function (pi: ExtensionAPI) {
 			"- 'scratchpad': Read SCRATCHPAD.md",
 			"- 'daily': Read a specific day's log (default: today). Pass date as YYYY-MM-DD.",
 			"- 'list': List all daily log files.",
-			"Reads the active scope set by default; pass 'scopes' to widen to another existing scope.",
+			"`scopes` is optional and defaults to the active scope set; it may name any existing scope (widening).",
+			"Results are grouped under `## Scope: <id>` headings in set order; scopes with no content are omitted.",
 		].join("\n"),
 		parameters: Type.Object({
 			target: StringEnum(["long_term", "scratchpad", "daily", "list"] as const, {
@@ -2674,13 +4502,15 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const sections = scopes.map((scope) => ({
-				scope: scope.id,
-				body: readMemoryTarget(scope.dir, target, date).text,
-			}));
+			// A scope with no content contributes no block at all; only when every
+			// scope is empty do we fall back to printing the per-scope messages.
+			const results = scopes.map((scope) => ({ scope, result: readMemoryTarget(scope.dir, target, date) }));
+			const withContent = results.filter(({ result }) => !result.empty);
+			const included = withContent.length > 0 ? withContent : results;
+			const sections = included.map(({ scope, result }) => ({ scope: scope.id, body: result.text }));
 			return {
 				content: [{ type: "text", text: formatScopedSections(sections) }],
-				details: { scopes: scopes.map((scope) => scope.id) },
+				details: { scopes: sections.map((section) => section.scope) },
 			};
 		},
 	});
@@ -2696,7 +4526,7 @@ export default function (pi: ExtensionAPI) {
 			"whose visible recovery ID can be passed to memory_restore if the deletion was wrong.",
 			"Use this when the user corrects a stored fact or a memory is no longer true —",
 			"stale entries keep resurfacing in retrieval and cause confidently wrong answers.",
-			"Deletes from your own project scope by default; 'global' is the only other writable scope.",
+			"`scope` is optional and defaults to your own scope. Deletes are allowed only from your own scope or 'global'; other scopes are rejected.",
 		].join("\n"),
 		parameters: Type.Object({
 			match: Type.String({
@@ -2810,6 +4640,7 @@ export default function (pi: ExtensionAPI) {
 		description: [
 			"Restore entries removed by memory_forget using the recovery ID returned by that tool.",
 			"Restoration is idempotent and appends only missing entries, so later memory writes survive.",
+			"Takes no scope parameter: the recovery ID identifies the record, and the record knows its scope.",
 		].join("\n"),
 		parameters: Type.Object({
 			recoveryId: Type.String({ description: "Recovery ID returned by memory_forget" }),
@@ -2880,7 +4711,9 @@ export default function (pi: ExtensionAPI) {
 			"- 'deep' (~10s): Hybrid search with reranking. Use when other modes don't find what you need.\n" +
 			"If semantic/deep warns about missing embeddings, embedding starts automatically in the background — retry shortly.\n" +
 			"If the first search doesn't find what you need, try rephrasing or switching modes. " +
-			"Keyword mode is best for specific terms; semantic mode finds related concepts even with different wording.",
+			"Keyword mode is best for specific terms; semantic mode finds related concepts even with different wording.\n" +
+			"`scopes` is optional and defaults to the active scope set; it may name any existing scope (widening). " +
+			"Results are grouped per scope under a `## Scope: <id>` heading; only scopes with hits appear.",
 		parameters: Type.Object({
 			query: Type.String({ description: "Search query" }),
 			mode: Type.Optional(
@@ -2922,42 +4755,40 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			let hasCollection = await checkCollection(GLOBAL_COLLECTION_NAME);
-			if (!hasCollection) {
-				// memory_search still targets the global collection; a project
-				// scope's collection is created at session start or on write.
-				const scopeState = scopeContext();
-				const globalScope: ScopeDirInfo =
-					scopeState.ownScope === "global"
-						? { id: "global", dir: scopeState.ownDir }
-						: { id: "global", dir: path.join(scopeState.memoryRoot, "global") };
-				const state = await ensureScopeCollection(globalScope);
-				hasCollection = state === "ready" || state === "created" || state === "repointed";
-			}
-			if (!hasCollection) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "Could not set up qmd pi-memory collection. Check that qmd is working and the memory directory exists.",
-						},
-					],
-					isError: true,
-					details: { scopes: scopeIds },
-				};
-			}
-
 			const mode = params.mode ?? "keyword";
 			const limit = clampSearchLimit(params.limit);
 
+			// Spec §4.2/§6.3: search each resolved scope's own collection. A
+			// scope whose directory or collection is unusable is skipped; the
+			// global collection is never required or created unless `global`
+			// is actually in the resolved set.
+			const searchable: Array<{ id: string; collection: string }> = [];
+			for (const scope of scopes) {
+				const state = await ensureScopeCollection({ id: scope.id, dir: scope.dir });
+				if (state !== "ready" && state !== "created" && state !== "repointed") continue;
+				const collection = collectionNameForScope(scope.id, scope.dir);
+				if (collection) searchable.push({ id: displayScopeId(scope.id), collection });
+			}
+
 			try {
-				const { results, stderr } = await runQmdSearch(mode, params.query, limit);
-				const needsEmbed = /need embeddings/i.test(stderr ?? "");
+				const perScopeResults =
+					searchable.length === 0
+						? []
+						: await Promise.all(
+								searchable.map((scope) => runQmdSearch(mode, params.query, limit, undefined, scope.collection)),
+							);
+				const stderr = perScopeResults.map((result) => result.stderr ?? "").join("\n");
+				const needsEmbed = /need embeddings/i.test(stderr);
 				// Self-heal: any "need embeddings" warning (even with partial
 				// results) kicks off an incremental background embed.
 				const embedStarted = needsEmbed ? ensureQmdEmbed() : false;
 
-				if (results.length === 0) {
+				const selected = mergeRoundRobin(
+					perScopeResults.map((result, scopeIndex) => result.results.map((hit) => ({ scopeIndex, hit }))),
+					limit,
+				);
+
+				if (selected.length === 0) {
 					if (needsEmbed && (mode === "semantic" || mode === "deep")) {
 						return {
 							content: [
@@ -2976,7 +4807,15 @@ export default function (pi: ExtensionAPI) {
 									].join("\n"),
 								},
 							],
-							details: { mode, query: params.query, scopes: scopeIds, count: 0, needsEmbed: true, embedStarted },
+							details: {
+								mode,
+								query: params.query,
+								scopes: scopeIds,
+								count: 0,
+								needsEmbed: true,
+								embedStarted,
+								scopeCounts: {},
+							},
 						};
 					}
 					return {
@@ -2986,25 +4825,32 @@ export default function (pi: ExtensionAPI) {
 								text: `No results found for "${params.query}" (mode: ${mode}).`,
 							},
 						],
-						details: { mode, query: params.query, scopes: scopeIds, count: 0, needsEmbed },
+						details: { mode, query: params.query, scopes: scopeIds, count: 0, needsEmbed, scopeCounts: {} },
 					};
 				}
 
-				const formatted = results
-					.map((r, i) => {
-						const parts: string[] = [`### Result ${i + 1}`];
-						const filePath = getQmdResultPath(r);
-						if (filePath) parts.push(`**File:** ${filePath}`);
-						if (r.score != null) parts.push(`**Score:** ${r.score}`);
-						const text = getQmdResultText(r);
-						if (text) parts.push(`\n${text}`);
-						return parts.join("\n");
+				const scopeCounts: Record<string, number> = {};
+				for (const scope of searchable) scopeCounts[scope.id] = 0;
+				for (const { scopeIndex } of selected) scopeCounts[searchable[scopeIndex].id]++;
+				const sections = searchable
+					.map((scope, scopeIndex) => {
+						const hits = selected
+							.filter((entry) => entry.scopeIndex === scopeIndex)
+							.map((entry, index) => formatSearchResult(entry.hit, index));
+						return hits.length > 0 ? `## Scope: ${scope.id}\n\n${hits.join("\n\n---\n\n")}` : "";
 					})
-					.join("\n\n---\n\n");
+					.filter(Boolean);
 
 				return {
-					content: [{ type: "text", text: formatted }],
-					details: { mode, query: params.query, scopes: scopeIds, count: results.length, needsEmbed },
+					content: [{ type: "text", text: sections.join("\n\n---\n\n") }],
+					details: {
+						mode,
+						query: params.query,
+						scopes: scopeIds,
+						count: selected.length,
+						needsEmbed,
+						scopeCounts,
+					},
 				};
 			} catch (err) {
 				return {
@@ -3026,40 +4872,46 @@ export default function (pi: ExtensionAPI) {
 		name: "memory_status",
 		label: "Memory Status",
 		description:
-			"Report the health of the memory system: where files live, what's stored, " +
-			"whether qmd search is available, whether the pi-memory collection exists, " +
-			"whether embeddings are ready, and the active configuration. " +
+			"Report the health of the memory system: the active scope set, each scope's directory " +
+			"and qmd collection state, orphan collections, which files are stored, whether qmd search " +
+			"is available, whether embeddings are ready, and the active configuration. " +
+			"Takes no scope parameter: it always reports every active scope. " +
 			"Use this when search behaves unexpectedly or to confirm setup.",
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
 			ensureDirs();
 			const inv = getMemoryInventory();
 
-			const qmdOk = qmdAvailable || (await detectQmd());
-			let collectionOk = false;
-			let embeddings: "ready" | "missing" | "unknown" | "n/a" = "n/a";
-			let diagnostics: CollectionDiagnostics | null = null;
-			if (qmdOk) {
-				diagnostics = await collectCollectionDiagnostics();
-				collectionOk = diagnostics.scopes.some((scope) => scope.scope === "global" && scope.exists);
-				if (!collectionOk) collectionOk = await checkCollection(GLOBAL_COLLECTION_NAME);
-				embeddings = collectionOk ? await probeEmbeddings() : "n/a";
-			}
+			const status = await gatherMemoryStatus();
+			const {
+				qmdAvailable: qmdOk,
+				collectionAvailable: collectionOk,
+				embeddings,
+				diagnostics,
+				scopes: scopeRows,
+			} = status;
 
 			const mark = (ok: boolean) => (ok ? "✓" : "✗");
+			const scopeMark = (state: "exists" | "missing" | "unchecked") =>
+				state === "exists" ? "✓" : state === "missing" ? "✗" : "—";
 			const lines: string[] = [
 				"# Memory status",
 				"",
 				`- Scope: ${ownScopeId} (own)`,
-				`- Active scopes: ${activeScopeSet.join(", ")}`,
+				`- Active scopes: ${activeScopeSet.map((id) => (id === ownScopeId ? `${displayScopeId(id)} (own)` : displayScopeId(id))).join(", ")}`,
 				`- Memory dir: ${inv.dir}`,
 				`- MEMORY.md: ${inv.longTermChars} chars`,
 				`- Scratchpad: ${inv.scratchpadOpen} open / ${inv.scratchpadTotal} total`,
 				`- Daily logs: ${inv.dailyCount}${inv.latestDaily ? ` (latest ${inv.latestDaily})` : ""}`,
 				"",
-				"## Search (qmd)",
-				`- qmd available: ${mark(qmdOk)}`,
+				"## Scopes",
 			];
+			for (const row of scopeRows) {
+				lines.push(
+					`- ${row.id}${row.own ? " (own)" : ""}: ${row.dir} — exists ${mark(row.dirExists)}, collection \`${row.collection ?? "—"}\`: ${scopeMark(row.collectionState)}`,
+				);
+			}
+			lines.push("", "## Search (qmd)", `- qmd available: ${mark(qmdOk)}`);
 
 			if (qmdOk) {
 				lines.push(`- Collection \`${GLOBAL_COLLECTION_NAME}\`: ${mark(collectionOk)}`);
@@ -3117,6 +4969,8 @@ export default function (pi: ExtensionAPI) {
 				lines.push("", qmdInstallInstructions());
 			}
 
+			const dirWarning = memoryDirWarning();
+
 			lines.push(
 				"",
 				"## Configuration",
@@ -3124,7 +4978,8 @@ export default function (pi: ExtensionAPI) {
 				`- PI_MEMORY_QMD_UPDATE: ${getQmdUpdateMode()}`,
 				`- PI_MEMORY_QMD_SEARCH_TIMEOUT_MS: ${getQmdSearchTimeoutMs()}`,
 				`- PI_MEMORY_EMBED_PROBE_TIMEOUT_MS: ${getEmbedProbeTimeoutMs()}`,
-				`- PI_MEMORY_DIR: ${process.env.PI_MEMORY_DIR ? "set" : "default"}`,
+				`- PI_MEMORY_DIR: ${process.env.PI_MEMORY_DIR ? `set (${memoryRoot})` : "default"}`,
+				...(dirWarning ? [`  - ⚠ ${dirWarning}`] : []),
 				`- PI_MEMORY_EXIT_SUMMARY: ${isExitSummaryEnabled() ? "enabled" : "disabled"}`,
 				`- PI_MEMORY_EXIT_SUMMARY_MODEL: ${process.env.PI_MEMORY_EXIT_SUMMARY_MODEL?.trim() || "session model"}`,
 				`- PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT: ${getExitSummaryReasoningEffort() ?? "off"}`,
@@ -3138,6 +4993,7 @@ export default function (pi: ExtensionAPI) {
 					qmd: qmdOk,
 					collection: collectionOk,
 					embeddings,
+					scopes: scopeRows,
 					collections: diagnostics?.scopes ?? [],
 					orphanCollections: diagnostics?.orphans ?? [],
 					orphanChunks: diagnostics?.orphanChunks ?? null,

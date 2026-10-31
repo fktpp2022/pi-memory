@@ -30,7 +30,7 @@ global | project:<slug> | project:<slug>#<hash>
 ```
 
 - `global` — the global scope. A full scope like any other: its own `MEMORY.md`, `daily/` and scratchpad. It is **opt-in per session** — never auto-included.
-- `project:<slug>` — a project scope. `<slug>` is the basename of the project root, lowercased, restricted to `[a-z0-9._-]`, overridable by the config file's `project` key.
+- `project:<slug>` — a project scope. `<slug>` is the basename of the project root with case preserved, any run of characters outside `[A-Za-z0-9._-]` replaced by `_`, overridable by the config file's `project` key.
 - `project:<slug>#<hash>` — the same scope with its uniqueness hash made explicit. The hash suffix is **optional in references only**; it exists to disambiguate (below).
 
 **Own scope (always, implicitly, never excludable).** A session's own scope is `project:<slug>` where the slug comes from the project root. Writes land in the session's own project identity, so a scope set that excluded the own scope would mean writing to a scope you cannot read. Every configuration layer therefore supplies only *extra* scopes.
@@ -49,7 +49,7 @@ global | project:<slug> | project:<slug>#<hash>
 
 # 2. Storage layout
 
-The memory root is `~/.pi/agent/memory` (overridable by `PI_MEMORY_DIR`, chapter 8) holding exactly two categories of child:
+The memory root is `~/.pi/agent/memory` (overridable by `PI_MEMORY_DIR`, chapter 8) holding exactly two categories of scope directory, plus the migration manifest once a migration has run:
 
 ```
 ~/.pi/agent/memory/
@@ -58,13 +58,13 @@ The memory root is `~/.pi/agent/memory` (overridable by `PI_MEMORY_DIR`, chapter
     SCRATCHPAD.md
     daily/YYYY-MM-DD.md
     recovery/
-    .migration-manifest.json
   projects/
     <slug>-<hash>/        ← one directory per project scope
       MEMORY.md
       SCRATCHPAD.md
       daily/
       recovery/
+  .migration-manifest.json  ← written by `/memory migrate --apply` (chapter 7.6)
 ```
 
 - `global/` and `projects/` are **siblings**, never nested: a collection over `~/.pi/agent/memory` would double-index everything in `projects/` (verified, appendix A).

@@ -8,7 +8,7 @@ A named bucket of memory that owns its own files. Two kinds exist: **global** an
 
 ## Scope id
 
-The string that identifies a scope in tool calls, config, env vars and injected headings. `global`, or `project:<slug>` (optionally `project:<slug>#<hash>` to disambiguate two projects with the same basename). The display form never carries the hash.
+The string that identifies a scope in tool calls, config, env vars and injected headings. `global`, or `project:<slug>` (optionally `project:<slug>#<hash>` to disambiguate two projects with the same basename). The display form never carries the hash; a listing appends `#<hash>` only when the bare slug is shared.
 
 ## Scope set
 
