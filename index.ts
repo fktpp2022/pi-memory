@@ -1890,13 +1890,17 @@ export interface MemoryStatusSnapshot {
 
 /**
  * The panel's header block: `pending` while the probe runs, so the directories
- * paint immediately instead of after the multi-second qmd check; `error` when
- * the probe fails, so an expanded Status never looks like a no-op.
+ * paint immediately and the qmd line spins as a visible background operation;
+ * `error` when the probe fails, so an expanded Status never looks like a no-op.
  */
 export type MemoryPanelStatusBlock =
-	| { kind: "pending" }
+	| { kind: "pending"; frame?: number }
 	| { kind: "ready"; snapshot: MemoryStatusSnapshot }
 	| { kind: "error"; message: string };
+
+/** Braille spinner matching pi's Loader defaults: 80 ms per frame. */
+const STATUS_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const STATUS_SPINNER_INTERVAL_MS = 80;
 
 /**
  * Shared status gathering for the `memory_status` tool and the /memory panel:
@@ -2717,7 +2721,8 @@ export function buildMemoryPanelHeader(
 			);
 		}
 		if (statusBlock.kind === "pending") {
-			lines.push("- qmd: … checking");
+			const frame = STATUS_SPINNER_FRAMES[(statusBlock.frame ?? 0) % STATUS_SPINNER_FRAMES.length];
+			lines.push(`- qmd: ${frame} checking`);
 		} else if (statusBlock.kind === "error") {
 			lines.push(`- qmd: ✗ status unavailable: ${statusBlock.message}`);
 		} else if (statusBlock.snapshot.qmdAvailable) {
@@ -2798,6 +2803,8 @@ class MemoryPanelView implements Component {
 	private state: MemoryPanelState;
 	private statusBlock: MemoryPanelStatusBlock | null = null;
 	private statusRequest = 0;
+	private spinFrame = 0;
+	private spinTimer: ReturnType<typeof setInterval> | null = null;
 	private selectedIndex = 0;
 	/** Last successful apply, shown as a summary line under the header. */
 	private summary: string | null = null;
@@ -2850,7 +2857,10 @@ class MemoryPanelView implements Component {
 		list.onSelect = (item) => {
 			void this.activate(item.value);
 		};
-		list.onCancel = () => this.actions.close();
+		list.onCancel = () => {
+			this.stopSpin();
+			this.actions.close();
+		};
 		list.onSelectionChange = (item) => {
 			const index = items.findIndex((candidate) => candidate.value === item.value);
 			if (index >= 0) this.selectedIndex = index;
@@ -2869,13 +2879,32 @@ class MemoryPanelView implements Component {
 		this.rebuild();
 	}
 
+	/** Tick the braille spinner while a probe is pending, matching pi's Loader cadence. */
+	private startSpin() {
+		this.spinFrame = 0;
+		if (this.spinTimer !== null) return;
+		this.spinTimer = setInterval(() => {
+			if (this.statusBlock?.kind !== "pending") return;
+			this.spinFrame++;
+			this.statusBlock = { kind: "pending", frame: this.spinFrame };
+			this.requestRender();
+		}, STATUS_SPINNER_INTERVAL_MS);
+	}
+
+	private stopSpin() {
+		if (this.spinTimer !== null) clearInterval(this.spinTimer);
+		this.spinTimer = null;
+	}
+
 	/**
 	 * Fetch status data off the input path. The block paints as pending first so
-	 * expanding Status is visibly instant; a failed probe reports itself instead
-	 * of leaving the block blank.
+	 * expanding Status is visibly instant, and the qmd line spins until the
+	 * snapshot lands; a failed probe reports itself instead of leaving the block
+	 * blank.
 	 */
 	private async loadStatus() {
 		const request = ++this.statusRequest;
+		this.startSpin();
 		this.statusBlock = { kind: "pending" };
 		this.requestRender();
 		try {
@@ -2886,6 +2915,7 @@ class MemoryPanelView implements Component {
 			if (request !== this.statusRequest || !this.state.statusExpanded) return;
 			this.statusBlock = { kind: "error", message: err instanceof Error ? err.message : String(err) };
 		}
+		this.stopSpin();
 		this.requestRender();
 	}
 
@@ -2900,9 +2930,12 @@ class MemoryPanelView implements Component {
 		if (action.kind === "status") {
 			this.state = { ...this.state, statusExpanded: action.expanded };
 			if (!action.expanded) {
+				const wasPending = this.statusBlock?.kind === "pending";
 				// Drop the in-flight probe so a late result cannot reopen the block.
 				this.statusRequest++;
 				this.statusBlock = null;
+				this.stopSpin();
+				if (wasPending) this.actions.notify("status check canceled");
 			}
 			this.rebuild();
 			if (action.expanded) void this.loadStatus();

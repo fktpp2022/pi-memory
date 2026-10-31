@@ -48,10 +48,11 @@ follows [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - Expanding `Status` in the `/memory` panel now paints the scope directories
-  immediately with `qmd: … checking`, then fills in qmd readiness when the
-  probe lands, and reports a failed probe instead of leaving the block blank —
-  previously the block stayed empty for the full multi-second probe, so the row
-  looked like a no-op.
+  immediately with a spinning `qmd: ⠋ checking` indicator (pi's Loader frame
+  cadence), fills in qmd readiness when the probe lands, and reports a failed
+  probe instead of leaving the block blank — previously the block stayed empty
+  for the full multi-second probe, so the row looked like a no-op. Collapsing
+  mid-probe cancels it and reports `status check canceled`.
 
 ## [0.4.2] — 2026-08-10
 

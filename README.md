@@ -186,9 +186,10 @@ summary line naming the applied set, so you can confirm before closing.
 
 `enter` on `Status` expands a block under the header with each active scope's
 directory (exists or missing) and qmd, collection and embeddings readiness;
-`enter` again collapses it. The directories appear immediately, `qmd` reads
-`checking` until the probe finishes, and a failed probe is reported in the block
-instead of leaving it blank. `enter` on `Migrate` shows the plan and
+`enter` again collapses it. The directories appear immediately, `qmd` shows a
+spinning `checking` indicator until the probe finishes, and a failed probe is
+reported in the block instead of leaving it blank. Collapsing while the probe
+is still running cancels it and says `status check canceled`. `enter` on `Migrate` shows the plan and
 asks for confirmation before moving anything — declining leaves everything
 untouched and the panel open, a plan with nothing left to do reports
 `nothing to migrate` instead of asking, and an installed legacy
