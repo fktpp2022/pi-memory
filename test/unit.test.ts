@@ -5709,7 +5709,7 @@ describe("/memory panel status action", () => {
 		test("renders the memory root, per-scope directories and qmd readiness", async () => {
 			const scopes = ["project:chezmoi#d24458d5", "global"];
 			const status = await gatherMemoryStatus();
-			const header = buildMemoryPanelHeader(scopes[0], scopes, root, status);
+			const header = buildMemoryPanelHeader(scopes[0], scopes, root, { kind: "ready", snapshot: status });
 
 			expect(header.split("\n")[0]).toBe(`Scopes: project:chezmoi (own), global · Root: ${root}`);
 			expect(header.split("\n")[1]).toBe("Status:");
@@ -5726,12 +5726,44 @@ describe("/memory panel status action", () => {
 		test("states when qmd is unavailable without querying collections", async () => {
 			_setQmdAvailable(false);
 			const status = await gatherMemoryStatus();
-			const header = buildMemoryPanelHeader("global", ["global"], root, status);
+			const header = buildMemoryPanelHeader("global", ["global"], root, { kind: "ready", snapshot: status });
 
 			expect(status.qmdAvailable).toBe(false);
 			expect(header).toContain("- qmd: ✗ unavailable");
 			expect(header).not.toContain("collection");
 			expect(header).not.toContain("embeddings:");
+		});
+
+		test("paints the scope directories immediately while qmd is still checking", () => {
+			const scopes = ["project:chezmoi#d24458d5", "global"];
+			const header = buildMemoryPanelHeader(scopes[0], scopes, root, { kind: "pending" });
+
+			expect(header.split("\n")[1]).toBe("Status:");
+			expect(header).toContain(
+				`- project:chezmoi (own): ${path.join(root, "projects", "chezmoi-d24458d5")} — exists ✓`,
+			);
+			expect(header).toContain(`- global: ${path.join(root, "global")} — exists ✓`);
+			expect(header).toContain("- qmd: ⠋ checking");
+		});
+
+		test("the checking indicator advances a frame at a time", () => {
+			const scopes = ["project:chezmoi#d24458d5"];
+			const first = buildMemoryPanelHeader(scopes[0], scopes, root, { kind: "pending", frame: 0 });
+			const second = buildMemoryPanelHeader(scopes[0], scopes, root, { kind: "pending", frame: 1 });
+
+			expect(first).toContain("- qmd: ⠋ checking");
+			expect(second).toContain("- qmd: ⠙ checking");
+		});
+
+		test("reports a failed status probe instead of leaving the block out", () => {
+			const scopes = ["project:chezmoi#d24458d5", "global"];
+			const header = buildMemoryPanelHeader(scopes[0], scopes, root, {
+				kind: "error",
+				message: "probe exploded",
+			});
+
+			expect(header).toContain(`- global: ${path.join(root, "global")} — exists ✓`);
+			expect(header).toContain("- qmd: ✗ status unavailable: probe exploded");
 		});
 
 		test("the collapsed header is unchanged", () => {
@@ -5776,6 +5808,7 @@ describe("/memory panel apply", () => {
 	const openPanel = async () => {
 		let component: any;
 		const done = mock(() => {});
+		const notify = mock(() => {});
 		const mockPi = createMockPi();
 		registerExtension(mockPi.pi as any);
 		await mockPi.commands.memory.options.handler("", {
@@ -5784,7 +5817,7 @@ describe("/memory panel apply", () => {
 			hasUI: true,
 			sessionManager: { getSessionId: () => "panelapply000001" },
 			ui: {
-				notify: mock(() => {}),
+				notify,
 				confirm: mock(async () => true),
 				custom: mock((factory: any) => {
 					component = factory({ requestRender: () => {} }, theme, { matches: () => false }, done);
@@ -5792,7 +5825,7 @@ describe("/memory panel apply", () => {
 				}),
 			},
 		});
-		return { component, done };
+		return { component, done, notify };
 	};
 
 	test("applying keeps the panel open, refreshes the header and shows the applied set", async () => {
@@ -5809,5 +5842,57 @@ describe("/memory panel apply", () => {
 		expect(rows[0]).toBe(`Scopes: project:chezmoi (own), project:other · Root: ${root}`);
 		expect(rows[1]).toBe("Applied: project:chezmoi (own), project:other");
 		expect(done).not.toHaveBeenCalled();
+	});
+
+	/** qmd is present but every probe hangs, so the block stays pending. */
+	const hangProbe = () => {
+		_clearQmdStatusCaches();
+		_setQmdAvailable(true);
+		_setExecFileForTest((() => {}) as any);
+	};
+
+	test("expanding Status paints the block before the qmd probe lands", async () => {
+		// The probe never settles: the block must not wait for it to appear.
+		hangProbe();
+		const { component } = await openPanel();
+
+		// own, project:other, global, Status
+		for (let i = 0; i < 3; i++) component.handleInput("\u001b[B");
+		component.handleInput("\r");
+		const lines = component.render(120).join("\n");
+
+		expect(lines).toContain(`- project:chezmoi (own): ${path.join(root, "projects", "chezmoi-d24458d5")} — exists ✓`);
+		expect(lines).toContain("- qmd: ⠋ checking");
+		component.handleInput("\u001b");
+	});
+
+	test("the checking indicator animates while the probe runs", async () => {
+		hangProbe();
+		const { component } = await openPanel();
+
+		for (let i = 0; i < 3; i++) component.handleInput("\u001b[B");
+		component.handleInput("\r");
+		const first = component.render(120).join("\n");
+
+		await new Promise((resolve) => setTimeout(resolve, 200));
+		const second = component.render(120).join("\n");
+
+		expect(first).toContain("⠋ checking");
+		expect(second).toContain("checking");
+		expect(second).not.toBe(first);
+		component.handleInput("\u001b");
+	});
+
+	test("collapsing Status mid-probe says the check was canceled", async () => {
+		hangProbe();
+		const { component, notify } = await openPanel();
+
+		for (let i = 0; i < 3; i++) component.handleInput("\u001b[B");
+		component.handleInput("\r");
+		component.handleInput("\r");
+
+		expect(notify.mock.calls[0]?.[0]).toBe("status check canceled");
+		expect(component.render(120).join("\n")).not.toContain("checking");
+		component.handleInput("\u001b");
 	});
 });

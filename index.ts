@@ -1889,6 +1889,20 @@ export interface MemoryStatusSnapshot {
 }
 
 /**
+ * The panel's header block: `pending` while the probe runs, so the directories
+ * paint immediately and the qmd line spins as a visible background operation;
+ * `error` when the probe fails, so an expanded Status never looks like a no-op.
+ */
+export type MemoryPanelStatusBlock =
+	| { kind: "pending"; frame?: number }
+	| { kind: "ready"; snapshot: MemoryStatusSnapshot }
+	| { kind: "error"; message: string };
+
+/** Braille spinner matching pi's Loader defaults: 80 ms per frame. */
+const STATUS_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const STATUS_SPINNER_INTERVAL_MS = 80;
+
+/**
  * Shared status gathering for the `memory_status` tool and the /memory panel:
  * one place for qmd detection, per-scope collection state and the global
  * collection/embeddings readiness. It owns its precondition — the own scope's
@@ -2646,18 +2660,44 @@ export function buildMemoryPanelSummary(state: MemoryPanelState): string {
 	return `Applied: ${scopes.join(", ")}`;
 }
 
+/** Per-scope directories, computed without qmd, for the block while the probe runs. */
+function panelStatusScopeRows(
+	ownScope: string,
+	activeScopes: readonly string[],
+	memoryRoot: string,
+): MemoryStatusScopeRow[] {
+	const isOwn = panelOwnIdMatcher(ownScope);
+	return activeScopes.map((id) => {
+		let info: ScopeDirInfo | null = null;
+		try {
+			info = resolveScopeDirectory(memoryRoot, id);
+		} catch {
+			// Ambiguous display id: nothing safe to show, but never break the panel.
+		}
+		const dir = info?.dir ?? scopeDirPath(memoryRoot, id) ?? "?";
+		return {
+			id: displayScopeId(info?.id ?? id),
+			own: isOwn(id),
+			dir,
+			dirExists: dir !== "?" && fs.existsSync(dir),
+			collection: null,
+			collectionState: "unchecked",
+		};
+	});
+}
+
 /**
  * Header: one line with the active scope set (own marked) and the memory root,
  * rebuilt from the applied set on every render. Labels reuse the shared
- * ambiguity rule, so two active same-slug scopes stay distinguishable. When
- * status data is supplied (Status expanded), a block with each active scope's
- * directory and qmd readiness follows.
+ * ambiguity rule, so two active same-slug scopes stay distinguishable. When the
+ * status block is supplied (Status expanded), each active scope's directory
+ * follows immediately; qmd readiness lands with the snapshot.
  */
 export function buildMemoryPanelHeader(
 	ownScope: string,
 	activeScopes: readonly string[],
 	memoryRoot: string,
-	status?: MemoryStatusSnapshot | null,
+	statusBlock?: MemoryPanelStatusBlock | null,
 ): string {
 	const labels = ambiguousLabels(activeScopes);
 	const isOwn = panelOwnIdMatcher(ownScope);
@@ -2668,17 +2708,26 @@ export function buildMemoryPanelHeader(
 		})
 		.join(", ");
 	const lines = [`Scopes: ${scopes} · Root: ${memoryRoot}`];
-	if (status) {
+	if (statusBlock) {
 		const mark = (ok: boolean) => (ok ? "✓" : "✗");
+		const rows =
+			statusBlock.kind === "ready"
+				? statusBlock.snapshot.scopes
+				: panelStatusScopeRows(ownScope, activeScopes, memoryRoot);
 		lines.push("Status:");
-		for (const scope of status.scopes) {
+		for (const scope of rows) {
 			lines.push(
 				`- ${scope.id}${scope.own ? " (own)" : ""}: ${scope.dir} — ${scope.dirExists ? "exists ✓" : "missing ✗"}`,
 			);
 		}
-		if (status.qmdAvailable) {
+		if (statusBlock.kind === "pending") {
+			const frame = STATUS_SPINNER_FRAMES[(statusBlock.frame ?? 0) % STATUS_SPINNER_FRAMES.length];
+			lines.push(`- qmd: ${frame} checking`);
+		} else if (statusBlock.kind === "error") {
+			lines.push(`- qmd: ✗ status unavailable: ${statusBlock.message}`);
+		} else if (statusBlock.snapshot.qmdAvailable) {
 			lines.push(
-				`- qmd: ✓ available, collection \`${GLOBAL_COLLECTION_NAME}\`: ${mark(status.collectionAvailable)}, embeddings: ${status.embeddings}`,
+				`- qmd: ✓ available, collection \`${GLOBAL_COLLECTION_NAME}\`: ${mark(statusBlock.snapshot.collectionAvailable)}, embeddings: ${statusBlock.snapshot.embeddings}`,
 			);
 		} else {
 			lines.push("- qmd: ✗ unavailable");
@@ -2729,8 +2778,8 @@ interface MemoryPanelActions {
 	apply: (extraScopes: string[]) => string | null;
 	/** Rebuild the list state from the applied set after a successful apply. */
 	freshState: () => MemoryPanelState;
-	/** Header rebuilt from the applied set and, when expanded, the current status. */
-	header: (ownScope: string, status: MemoryStatusSnapshot | null) => string;
+	/** Header rebuilt from the applied set and, when expanded, the current status block. */
+	header: (ownScope: string, statusBlock: MemoryPanelStatusBlock | null) => string;
 	/** Gather the same status data the memory_status tool reports. */
 	status: () => Promise<MemoryStatusSnapshot>;
 	/** Fresh migration preview from the existing planner, or the installed-extension refusal. */
@@ -2752,8 +2801,10 @@ interface MemoryPanelActions {
 class MemoryPanelView implements Component {
 	private list: SelectList;
 	private state: MemoryPanelState;
-	private status: MemoryStatusSnapshot | null = null;
+	private statusBlock: MemoryPanelStatusBlock | null = null;
 	private statusRequest = 0;
+	private spinFrame = 0;
+	private spinTimer: ReturnType<typeof setInterval> | null = null;
 	private selectedIndex = 0;
 	/** Last successful apply, shown as a summary line under the header. */
 	private summary: string | null = null;
@@ -2806,7 +2857,10 @@ class MemoryPanelView implements Component {
 		list.onSelect = (item) => {
 			void this.activate(item.value);
 		};
-		list.onCancel = () => this.actions.close();
+		list.onCancel = () => {
+			this.stopSpin();
+			this.actions.close();
+		};
 		list.onSelectionChange = (item) => {
 			const index = items.findIndex((candidate) => candidate.value === item.value);
 			if (index >= 0) this.selectedIndex = index;
@@ -2825,12 +2879,43 @@ class MemoryPanelView implements Component {
 		this.rebuild();
 	}
 
-	/** Fetch status data off the input path and repaint when it lands. */
+	/** Tick the braille spinner while a probe is pending, matching pi's Loader cadence. */
+	private startSpin() {
+		this.spinFrame = 0;
+		if (this.spinTimer !== null) return;
+		this.spinTimer = setInterval(() => {
+			if (this.statusBlock?.kind !== "pending") return;
+			this.spinFrame++;
+			this.statusBlock = { kind: "pending", frame: this.spinFrame };
+			this.requestRender();
+		}, STATUS_SPINNER_INTERVAL_MS);
+	}
+
+	private stopSpin() {
+		if (this.spinTimer !== null) clearInterval(this.spinTimer);
+		this.spinTimer = null;
+	}
+
+	/**
+	 * Fetch status data off the input path. The block paints as pending first so
+	 * expanding Status is visibly instant, and the qmd line spins until the
+	 * snapshot lands; a failed probe reports itself instead of leaving the block
+	 * blank.
+	 */
 	private async loadStatus() {
 		const request = ++this.statusRequest;
-		const status = await this.actions.status();
-		if (request !== this.statusRequest || !this.state.statusExpanded) return;
-		this.status = status;
+		this.startSpin();
+		this.statusBlock = { kind: "pending" };
+		this.requestRender();
+		try {
+			const snapshot = await this.actions.status();
+			if (request !== this.statusRequest || !this.state.statusExpanded) return;
+			this.statusBlock = { kind: "ready", snapshot };
+		} catch (err) {
+			if (request !== this.statusRequest || !this.state.statusExpanded) return;
+			this.statusBlock = { kind: "error", message: err instanceof Error ? err.message : String(err) };
+		}
+		this.stopSpin();
 		this.requestRender();
 	}
 
@@ -2844,7 +2929,14 @@ class MemoryPanelView implements Component {
 		if (action.kind === "none") return;
 		if (action.kind === "status") {
 			this.state = { ...this.state, statusExpanded: action.expanded };
-			if (!action.expanded) this.status = null;
+			if (!action.expanded) {
+				const wasPending = this.statusBlock?.kind === "pending";
+				// Drop the in-flight probe so a late result cannot reopen the block.
+				this.statusRequest++;
+				this.statusBlock = null;
+				this.stopSpin();
+				if (wasPending) this.actions.notify("status check canceled");
+			}
 			this.rebuild();
 			if (action.expanded) void this.loadStatus();
 			return;
@@ -2903,7 +2995,7 @@ class MemoryPanelView implements Component {
 	}
 
 	render(width: number): string[] {
-		const header = this.actions.header(this.state.ownScope, this.state.statusExpanded ? this.status : null);
+		const header = this.actions.header(this.state.ownScope, this.state.statusExpanded ? this.statusBlock : null);
 		const lines = this.summary ? [header, this.summary] : [header];
 		return [...lines.join("\n").split("\n"), ...this.list.render(width)];
 	}
@@ -2930,7 +3022,8 @@ async function openMemoryPanel(ctx: ExtensionCommandContext): Promise<void> {
 					}
 				},
 				freshState: currentPanelState,
-				header: (ownScope, status) => buildMemoryPanelHeader(ownScope, activeScopeSet, memoryRoot, status),
+				header: (ownScope, statusBlock) =>
+					buildMemoryPanelHeader(ownScope, activeScopeSet, memoryRoot, statusBlock),
 				status: gatherMemoryStatus,
 				migratePreview: buildMemoryPanelMigration,
 				confirmMigrate: (summary) => ctx.ui.confirm("Migrate memory layout?", summary),
